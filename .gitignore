@@ -1,0 +1,7 @@
+__pycache__/
+unsloth_compiled_cache/
+.claude/
+models/
+*.pth
+output/
+logs/
