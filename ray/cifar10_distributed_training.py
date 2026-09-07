@@ -235,11 +235,14 @@ def train_func(config):
             dist.all_reduce(ta, op=dist.ReduceOp.AVG)
             test_acc = ta.item()
 
+        is_best = test_acc > best_test_acc
+        if is_best:
+            best_test_acc = test_acc
+
         if config.get("save_models"):
             save_checkpoint(model, optimizer, epoch, train_acc, test_acc,
                             config, is_best=False, world_rank=world_rank)
-            if test_acc > best_test_acc:
-                best_test_acc = test_acc
+            if is_best:
                 save_checkpoint(model, optimizer, epoch, train_acc, test_acc,
                                 config, is_best=True, world_rank=world_rank)
 
