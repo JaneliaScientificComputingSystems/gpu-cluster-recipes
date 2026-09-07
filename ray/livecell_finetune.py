@@ -491,8 +491,11 @@ def train_func(config):
                 dist.all_reduce(vm, op=dist.ReduceOp.AVG)
                 val_miou = vm.item()
 
-            if config.get("save_models") and val_miou > best_miou:
+            is_best = val_miou > best_miou
+            if is_best:
                 best_miou = val_miou
+
+            if config.get("save_models") and is_best:
                 save_checkpoint(model, optimizer, epoch, val_miou,
                                 config, is_best=True, world_rank=world_rank)
 
