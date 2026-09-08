@@ -436,8 +436,11 @@ def main():
             val_top1 = t1.item()
             val_top5 = t5.item()
 
-            if args.save_models and val_top1 > best_top1 and world_rank == 0:
+            is_best = val_top1 > best_top1
+            if is_best:
                 best_top1 = val_top1
+
+            if args.save_models and is_best and world_rank == 0:
                 save_checkpoint(model, optimizer, epoch, val_top1, val_top5,
                                 args, is_best=True)
 

@@ -309,8 +309,11 @@ def train_func(config):
                 val_top1 = t1.item()
                 val_top5 = t5.item()
 
-            if config.get("save_models") and val_top1 > best_top1:
+            is_best = val_top1 > best_top1
+            if is_best:
                 best_top1 = val_top1
+
+            if config.get("save_models") and is_best:
                 save_checkpoint(model, optimizer, epoch, val_top1, val_top5,
                                 config, is_best=True, world_rank=world_rank)
 
