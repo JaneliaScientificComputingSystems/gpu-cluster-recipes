@@ -137,7 +137,7 @@ def accuracy(output, target, topk=(1, 5)):
 # Checkpoint save/load
 # ---------------------------------------------------------------------------
 
-def save_checkpoint(model, optimizer, epoch, top1, top5, args, is_best=False):
+def save_checkpoint(model, optimizer, epoch, top1, top5, best_top1, args, is_best=False):
     model_dir = args.model_dir
     os.makedirs(model_dir, exist_ok=True)
     suffix = "best" if is_best else "latest"
@@ -150,18 +150,28 @@ def save_checkpoint(model, optimizer, epoch, top1, top5, args, is_best=False):
         "optimizer_state_dict": optimizer.state_dict(),
         "top1_accuracy": top1,
         "top5_accuracy": top5,
+        "best_top1": best_top1,
     }, path)
     print(f"Checkpoint saved: {path}  (top1={top1:.2f}% top5={top5:.2f}%)")
 
 
-def load_checkpoint(path, model, optimizer, device):
+def load_checkpoint(path, model, optimizer, device, world_rank=0):
+    """Restore model and optimizer. Called on every rank: DDP syncs weights
+    only when it is constructed, so a rank-0-only load would leave the other
+    replicas at random init."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Checkpoint not found: {path}")
     ckpt = torch.load(path, map_location=device)
     raw = model.module if hasattr(model, "module") else model
     raw.load_state_dict(ckpt["model_state_dict"])
     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
     start_epoch = ckpt["epoch"] + 1
-    best_top1 = ckpt.get("top1_accuracy", 0)
-    print(f"Resumed from epoch {start_epoch}, best top1 {best_top1:.2f}%")
+    # "top1_accuracy" is the train accuracy in a *_latest checkpoint, so it
+    # cannot seed the best validation score. Checkpoints written before
+    # "best_top1" existed restart best tracking from 0.
+    best_top1 = float(ckpt.get("best_top1", 0.0))
+    if world_rank == 0:
+        print(f"Resumed from epoch {start_epoch}, best val top1 {best_top1:.2f}%")
     return start_epoch, best_top1
 
 
@@ -171,10 +181,13 @@ def load_checkpoint(path, model, optimizer, device):
 
 def verify_ib_in_use():
     import subprocess
-    ib_devs = ["mlx5_0", "mlx5_1", "mlx5_2", "mlx5_3",
-               "mlx5_4", "mlx5_6", "mlx5_7", "mlx5_8"]
-    eth_dev = "mlx5_5"
+    # Check the HCAs NCCL was told to use — they differ per node type
+    # (H100/H200 vs B300, see ../nccl-ib/), so there is no fixed list.
+    nccl_hca = os.environ.get("NCCL_IB_HCA", "")
+    ib_devs = [d.strip() for d in nccl_hca.split(",") if d.strip()]
     print("--- IB device check ---")
+    if not ib_devs:
+        print("  WARN NCCL_IB_HCA is not set — no devices to check")
     for dev in ib_devs:
         try:
             r = subprocess.run(["ibv_devinfo", "-d", dev],
@@ -187,11 +200,6 @@ def verify_ib_in_use():
             print(f"  {'OK  ' if ok else 'WARN'} {dev}: {link} | {state}")
         except Exception as e:
             print(f"  ERR  {dev}: {e}")
-    nccl_hca = os.environ.get("NCCL_IB_HCA", "")
-    if eth_dev in nccl_hca:
-        print(f"  ERROR: {eth_dev} (Ethernet) is in NCCL_IB_HCA — remove it!")
-    else:
-        print(f"  OK   {eth_dev} (Ethernet) correctly excluded from NCCL_IB_HCA")
     print("-----------------------")
 
 
@@ -259,6 +267,8 @@ def main():
     val_files = sorted(glob.glob(os.path.join(parquet_dir, "validation-*.parquet")))
     if not train_files:
         raise FileNotFoundError(f"No train parquet files in {parquet_dir}")
+    if not val_files:
+        raise FileNotFoundError(f"No validation parquet files in {parquet_dir}")
 
     if world_rank == 0:
         print(f"Loading ImageNet: {len(train_files)} train shards, "
@@ -329,17 +339,11 @@ def main():
     best_top1 = 0.0
     start_epoch = 0
 
+    # Every rank loads the checkpoint (shared filesystem) so all replicas
+    # resume with the same weights and optimizer state.
     if args.resume:
-        if world_rank == 0:
-            start_epoch, best_top1 = load_checkpoint(
-                args.resume, model, optimizer, device)
-        # Broadcast resume state
-        se = torch.tensor(start_epoch, device=device)
-        bt = torch.tensor(best_top1, device=device)
-        dist.broadcast(se, src=0)
-        dist.broadcast(bt, src=0)
-        start_epoch = int(se.item())
-        best_top1 = bt.item()
+        start_epoch, best_top1 = load_checkpoint(
+            args.resume, model, optimizer, device, world_rank)
 
     # -----------------------------------------------------------------------
     # Training loop
@@ -365,9 +369,10 @@ def main():
         total = 0
         t0 = time.time()
         images_processed = 0
+        num_batches = 0
 
-        for batch_idx, (data, targets) in enumerate(train_loader):
-            if batch_idx >= steps_per_epoch:   # keep all ranks lock-step for DDP
+        for data, targets in train_loader:
+            if num_batches >= steps_per_epoch:   # keep all ranks lock-step for DDP
                 break
             data = data.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
@@ -387,22 +392,23 @@ def main():
             total += targets.size(0)
             correct += output.argmax(1).eq(targets).sum().item()
             images_processed += data.size(0)
+            num_batches += 1
 
-            if world_rank == 0 and (batch_idx + 1) % 100 == 0:
+            if world_rank == 0 and num_batches % 100 == 0:
                 elapsed = time.time() - t0
                 img_sec = images_processed * world_size / elapsed
-                print(f"  Epoch {epoch} [{batch_idx + 1}/{steps_per_epoch}] "
+                print(f"  Epoch {epoch} [{num_batches}/{steps_per_epoch}] "
                       f"loss={loss.item():.4f} lr={lr:.6f} "
                       f"{img_sec:.0f} img/s")
 
-        num_batches = batch_idx + 1
         train_loss = epoch_loss / max(num_batches, 1)
         train_top1 = 100.0 * correct / max(total, 1)
         elapsed = time.time() - t0
         img_sec = images_processed * world_size / max(elapsed, 1)
 
         if args.save_models and world_rank == 0:
-            save_checkpoint(model, optimizer, epoch, train_top1, 0, args, is_best=False)
+            save_checkpoint(model, optimizer, epoch, train_top1, 0, best_top1,
+                            args, is_best=False)
 
         # -------------------------------------------------------------------
         # Validation
@@ -442,7 +448,7 @@ def main():
 
             if args.save_models and is_best and world_rank == 0:
                 save_checkpoint(model, optimizer, epoch, val_top1, val_top5,
-                                args, is_best=True)
+                                best_top1, args, is_best=True)
 
         if world_rank == 0:
             val_str = (f"val_top1={val_top1:.2f}% val_top5={val_top5:.2f}%"

@@ -34,6 +34,8 @@ Options:
   --workdir=PATH       Working directory (default: script's directory)
   --job-name=NAME      Job name (default: torchrun_job)
   --walltime=TIME      Walltime H:MM (default: 24:00 non-parallel, auto for parallel)
+  --output-dir=PATH    Output log directory (default: ../output)
+  --host="H1 H2 ..."   Pin the job to specific hosts (#BSUB -m)
 
 Script args go after '--':
   ./submit_torchrun_job.sh 2 --script=train.py -- --epochs=50 --batch-size=128

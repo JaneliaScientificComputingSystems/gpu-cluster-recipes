@@ -18,7 +18,7 @@
 #   --queue Q           CPU LSF queue                       [local]
 #   --walltime H:MM     LSF walltime                        [24:00]
 #   --cpus N            CPU slots (1 slot ~= 16 G RAM)      [1]
-#   --data-dir PATH     Open WebUI data dir                 [/scratch/$USER/open-webui]
+#   --data-dir PATH     Open WebUI data dir                 [/scratch/$USER/open-webui-vllm]
 #   --login-host HOST   host to tunnel through in the hint  [login.int.janelia.org]
 #   --image REF         Open WebUI image  [ghcr.io/open-webui/open-webui:main]
 #===============================================================================
@@ -44,7 +44,7 @@ while [[ $# -gt 0 ]]; do
     --login-host=*) LOGIN_HOST="${1#*=}"; shift ;; --login-host) LOGIN_HOST="$2"; shift 2 ;;
     --domain=*) DOMAIN="${1#*=}"; shift ;;         --domain) DOMAIN="$2"; shift 2 ;;
     --image=*) IMAGE="${1#*=}"; shift ;;           --image) IMAGE="$2"; shift 2 ;;
-    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,24p' "$0"; exit 0 ;;
     *) echo "Unknown option: $1" >&2; exit 1 ;;
   esac
 done
@@ -60,9 +60,12 @@ unset XDG_RUNTIME_DIR
 mkdir -p /scratch/\$USER/podman-run /scratch/\$USER/podman-storage ${DATA_DIR}
 podman system migrate 2>/dev/null || true
 podman info >/dev/null 2>&1 || podman system reset -f
-trap 'podman rm -f ${JOB_NAME} 2>/dev/null; pkill -u \$USER catatonit 2>/dev/null' EXIT
+# per-job container name, so a second UI job on this node cannot clash with or remove this one
+CTR=${JOB_NAME}_\$LSB_JOBID
+# only reap the rootless pause process (catatonit) when no other container of ours is left on the node
+trap 'podman rm -f \$CTR 2>/dev/null; [ -n "\$(podman ps -q 2>/dev/null)" ] || pkill -u \$USER catatonit 2>/dev/null' EXIT
 echo "OPEN-WEBUI on \$(hostname -s):${PORT} -> ${MODEL_URL}"
-podman run --rm --name ${JOB_NAME} --network=host \
+podman run --rm --name \$CTR --network=host \
   -e WEBUI_AUTH=False -e ENABLE_OLLAMA_API=False \
   -e OPENAI_API_BASE_URL=${MODEL_URL} -e OPENAI_API_KEY=dummy \
   -e PORT=${PORT} \
@@ -71,15 +74,16 @@ podman run --rm --name ${JOB_NAME} --network=host \
 EOF
 )
 echo "$SUBMIT"
-JOBID=$(echo "$SUBMIT" | grep -oE 'Job <[0-9]+>' | grep -oE '[0-9]+' | head -1)
+# "|| true": under set -e/pipefail a non-matching grep (or a transient bjobs error below) would abort silently
+JOBID=$(echo "$SUBMIT" | grep -oE 'Job <[0-9]+>' | grep -oE '[0-9]+' | head -1 || true)
 [ -n "$JOBID" ] || { echo "ERROR: submission failed"; exit 1; }
 
 echo -n "Waiting for job $JOBID to start"
 NODE=""
 for i in $(seq 1 200); do
-    st=$(bjobs -o "stat" "$JOBID" 2>/dev/null | tail -1 | tr -d ' ')
+    st=$(bjobs -o "stat" "$JOBID" 2>/dev/null | tail -1 | tr -d ' ' || true)
     if [ "$st" = "RUN" ]; then
-        NODE=$(bjobs -o "exec_host" "$JOBID" 2>/dev/null | tail -1 | tr -d ' ' | sed 's/^[0-9]*\*//; s/:.*//')
+        NODE=$(bjobs -o "exec_host" "$JOBID" 2>/dev/null | tail -1 | tr -d ' ' | sed 's/^[0-9]*\*//; s/:.*//' || true)
         break
     fi
     [ "$st" = "EXIT" ] || [ "$st" = "DONE" ] && { echo; echo "ERROR: job $st before starting"; exit 1; }

@@ -112,12 +112,21 @@ def main():
         start = time.perf_counter()
         it = last_it = 0
         last = start
-        while time.perf_counter() - start < args.secs:
+        # Rank 0 owns the clock and broadcasts the stop decision every 20 iters, so
+        # every rank runs the same number of all_reduces. (Per-rank clocks could
+        # disagree at the deadline and leave one rank in a collective nobody joins.)
+        stop = torch.zeros(1, dtype=torch.int32, device=dev)
+        while True:
             dist.all_reduce(t)
             it += 1
             if it % 20 == 0:
                 torch.cuda.synchronize()
                 now = time.perf_counter()
+                if is0 and now - start >= args.secs:
+                    stop.fill_(1)
+                dist.broadcast(stop, src=0)
+                if stop.item():
+                    break
                 if is0 and now - last >= 5:
                     d = (now - last) / (it - last_it)
                     algbw = nbytes / d / 1e9

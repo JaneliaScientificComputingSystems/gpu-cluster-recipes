@@ -81,25 +81,38 @@ MODULES=""
 WORK_DIR=""
 OUTPUT_DIR=""
 SCRIPT_ARGS=""
+SCRIPT_ARGS_Q=""
 USER_NUM_GPUS=""
 USER_NUM_CPUS=""
 HOST_SELECT=""
 
+# bash does not expand "~" inside --opt=~/path, so do it for path options
+expand_tilde() {
+    case "$1" in
+        "~")    echo "$HOME" ;;
+        "~/"*)  echo "$HOME/${1#\~/}" ;;
+        *)      echo "$1" ;;
+    esac
+}
+
 while [[ $# -gt 0 ]]; do
     case $1 in
         --queue=*)      QUEUE_NAME="${1#*=}"; shift ;;
-        --script=*)     PYTHON_SCRIPT="${1#*=}"; shift ;;
+        --script=*)     PYTHON_SCRIPT="$(expand_tilde "${1#*=}")"; shift ;;
         --num-gpus=*)   USER_NUM_GPUS="${1#*=}"; shift ;;
         --num-cpus=*)   USER_NUM_CPUS="${1#*=}"; shift ;;
         --job-name=*)   JOB_NAME="${1#*=}"; shift ;;
         --walltime=*)   WALLTIME="${1#*=}"; shift ;;
-        --venv=*)       VENV_PATH="${1#*=}"; shift ;;
+        --venv=*)       VENV_PATH="$(expand_tilde "${1#*=}")"; shift ;;
         --conda=*)      CONDA_ENV="${1#*=}"; shift ;;
         --modules=*)    MODULES="${1#*=}"; shift ;;
-        --workdir=*)    WORK_DIR="${1#*=}"; shift ;;
-        --output-dir=*) OUTPUT_DIR="${1#*=}"; shift ;;
+        --workdir=*)    WORK_DIR="$(expand_tilde "${1#*=}")"; shift ;;
+        --output-dir=*) OUTPUT_DIR="$(expand_tilde "${1#*=}")"; shift ;;
         --host=*)       HOST_SELECT="${1#*=}"; shift ;;
-        --) shift; SCRIPT_ARGS="$*"; break ;;
+        --) shift; SCRIPT_ARGS="$*"
+            # shell-quoted copy, so args with spaces/quotes/\$ reach the script intact
+            [ $# -gt 0 ] && SCRIPT_ARGS_Q=$(printf '%q ' "$@")
+            break ;;
         *) echo "Unknown option: $1"; usage ;;
     esac
 done
@@ -218,16 +231,19 @@ echo "================================================================"
 #-----------------------------------------------------------------------
 # Write worker launch script to shared NFS (accessible from all nodes)
 # Written at submission time to avoid heredoc quoting nightmares.
-# Dynamic values (MASTER_ADDR, MASTER_PORT, NODE_RANK) passed as args.
+# Dynamic values (MASTER_ADDR, MASTER_PORT, NODE_RANK) passed as args; the
+# training script and its args are baked in (shell-quoted) so they survive
+# blaunch untouched.
 #-----------------------------------------------------------------------
 WORKER_SCRIPT="${OUTPUT_DIR}/.torchrun_worker_$$.sh"
+WORKER_SCRIPT_Q=$(printf '%q' "$WORKER_SCRIPT")
+WORK_DIR_Q=$(printf '%q' "$WORK_DIR")
 
 cat > "$WORKER_SCRIPT" << 'WORKER_EOF'
 #!/bin/bash
 # Per-node torchrun worker — launched by blaunch on each node
-# Usage: worker.sh NODE_RANK NUM_NODES GPUS_PER_NODE MASTER_ADDR MASTER_PORT [script] [args...]
+# Usage: worker.sh NODE_RANK NUM_NODES GPUS_PER_NODE MASTER_ADDR MASTER_PORT
 NODE_RANK=$1; NUM_NODES=$2; GPUS_PER_NODE=$3; MASTER_ADDR=$4; MASTER_PORT=$5
-shift 5
 
 echo "================================================================"
 echo "Worker node $NODE_RANK of $NUM_NODES — $(hostname) — $(date)"
@@ -243,7 +259,7 @@ torchrun \
     --master_port=$MASTER_PORT \
     --rdzv_backend=c10d \
     --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
-    "$@"
+    __SCRIPT_CMD__
 
 EXIT_CODE=$?
 echo "Worker $NODE_RANK finished — exit code: $EXIT_CODE — $(date)"
@@ -264,19 +280,19 @@ fi
 
 # Python environment activation
 if [ -n "$VENV_PATH" ]; then
-    ENV_BLOCK="${ENV_BLOCK}source ${VENV_PATH}/bin/activate"$'\n'
+    ENV_BLOCK="${ENV_BLOCK}source $(printf '%q' "${VENV_PATH}/bin/activate")"$'\n'
 elif [ -n "$CONDA_ENV" ]; then
     ENV_BLOCK="${ENV_BLOCK}"'eval "$(mamba shell hook --shell bash 2>/dev/null || conda shell.bash hook)"'$'\n'
     ENV_BLOCK="${ENV_BLOCK}mamba activate ${CONDA_ENV} 2>/dev/null || conda activate ${CONDA_ENV}"$'\n'
 fi
 
 # Working directory and PYTHONPATH
-ENV_BLOCK="${ENV_BLOCK}cd ${WORK_DIR}"$'\n'
+ENV_BLOCK="${ENV_BLOCK}cd ${WORK_DIR_Q}"$'\n'
 ENV_BLOCK="${ENV_BLOCK}"'export PYTHONPATH="${PYTHONPATH}:'"${WORK_DIR}"'"'$'\n'
 
 # NCCL configuration
 if [ "$NETWORK_BACKEND" = "IB" ] && [ -f "$NCCL_ENV_FILE" ]; then
-    ENV_BLOCK="${ENV_BLOCK}source ${NCCL_ENV_FILE}"$'\n'
+    ENV_BLOCK="${ENV_BLOCK}source $(printf '%q' "${NCCL_ENV_FILE}")"$'\n'
 else
     ENV_BLOCK="${ENV_BLOCK}export NCCL_IB_DISABLE=1"$'\n'
     ENV_BLOCK="${ENV_BLOCK}export NCCL_NET_GDR_LEVEL=0"$'\n'
@@ -284,7 +300,10 @@ else
     ENV_BLOCK="${ENV_BLOCK}export NCCL_SHM_DISABLE=0"$'\n'
     ENV_BLOCK="${ENV_BLOCK}export NCCL_BUFFSIZE=8388608"$'\n'
     ENV_BLOCK="${ENV_BLOCK}export NCCL_DEBUG=INFO"$'\n'
-    ENV_BLOCK="${ENV_BLOCK}export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7"$'\n'
+    # Whole-node (parallel) jobs own every GPU; elsewhere keep the GPUs LSF assigned
+    if [ "$PARALLEL_QUEUE" = true ]; then
+        ENV_BLOCK="${ENV_BLOCK}export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7"$'\n'
+    fi
 fi
 
 # Splice ENV_BLOCK into worker script (replace the marker line)
@@ -295,8 +314,8 @@ marker = '# __ENV_SETUP__ (replaced below)'
 with open(sys.argv[1], 'r') as f:
     content = f.read()
 with open(sys.argv[1], 'w') as f:
-    f.write(content.replace(marker, sys.argv[2]))
-" "$WORKER_SCRIPT" "$ENV_BLOCK"
+    f.write(content.replace(marker, sys.argv[2]).replace('__SCRIPT_CMD__', sys.argv[3]))
+" "$WORKER_SCRIPT" "$ENV_BLOCK" "$(printf '%q' "$PYTHON_SCRIPT") ${SCRIPT_ARGS_Q}"
 
 chmod +x "$WORKER_SCRIPT"
 
@@ -357,7 +376,14 @@ MASTER_HOST=\${hosts[0]}
 MASTER_ADDR=\$(getent ahostsv4 \${MASTER_HOST} | awk 'NR==1{print \$1}')
 
 # Find a free port
-MASTER_PORT=\$(python -c 'import socket; s=socket.socket(); s.bind(("0.0.0.0", 0)); print(s.getsockname()[1]); s.close()')
+# (python3 first: no venv is active here and nodes may have no unversioned "python")
+PORT_PY='import socket; s=socket.socket(); s.bind(("0.0.0.0", 0)); print(s.getsockname()[1]); s.close()'
+MASTER_PORT=\$(python3 -c "\$PORT_PY" 2>/dev/null || python -c "\$PORT_PY")
+if [ -z "\$MASTER_PORT" ]; then
+    echo "ERROR: could not pick a free master port (no python3/python on \$(hostname)?)"
+    rm -f ${WORKER_SCRIPT_Q}
+    exit 1
+fi
 
 echo "Host list:    \${hosts[@]}"
 echo "Nodes:        \$NUM_NODES | GPUs: \$TOTAL_GPUS | Network: ${NETWORK_BACKEND}"
@@ -371,7 +397,9 @@ if [ "${NETWORK_BACKEND}" = "IB" ]; then
         echo "ERROR: ibv_devinfo failed — IB drivers may not be loaded on this node"
         exit 1
     }
-    active_ports=\$(blaunch -z \${hosts[0]} "ibstat 2>/dev/null | grep -c 'State: Active'" 2>/dev/null || echo 0)
+    # grep -c prints "0" AND exits 1 on no match, so don't "|| echo 0" (that yields two lines)
+    active_ports=\$(blaunch -z \${hosts[0]} "ibstat 2>/dev/null | grep -c 'State: Active'" 2>/dev/null | head -1)
+    [[ "\$active_ports" =~ ^[0-9]+\$ ]] || active_ports=0
     echo "Active IB ports on head node: \$active_ports (expected 8)"
     if [ "\$active_ports" -lt 8 ]; then
         echo "WARNING: fewer than 8 IB ports active — some rails may be down"
@@ -388,8 +416,7 @@ echo "================================================================"
 #-----------------------------------------------------------------------
 if [ \$NUM_NODES -eq 1 ]; then
     # Single-node: run worker script directly (node_rank=0)
-    ${WORKER_SCRIPT} 0 1 \$GPUS_PER_NODE 127.0.0.1 \$MASTER_PORT \
-        ${PYTHON_SCRIPT} ${SCRIPT_ARGS}
+    ${WORKER_SCRIPT_Q} 0 1 \$GPUS_PER_NODE 127.0.0.1 \$MASTER_PORT
     EXIT_CODE=\$?
 else
     # Multi-node: blaunch worker script on each node
@@ -398,8 +425,7 @@ else
         host=\${hosts[\$i]}
         echo "  Node \$i: \$host"
 
-        blaunch -z \$host ${WORKER_SCRIPT} \$i \$NUM_NODES \$GPUS_PER_NODE \$MASTER_ADDR \$MASTER_PORT \
-            ${PYTHON_SCRIPT} ${SCRIPT_ARGS} &
+        blaunch -z \$host ${WORKER_SCRIPT_Q} \$i \$NUM_NODES \$GPUS_PER_NODE \$MASTER_ADDR \$MASTER_PORT &
         PIDS+=(\$!)
     done
 
@@ -415,7 +441,7 @@ else
 fi
 
 # Cleanup worker script
-rm -f ${WORKER_SCRIPT}
+rm -f ${WORKER_SCRIPT_Q}
 
 echo ""
 echo "================================================================"

@@ -37,7 +37,8 @@ SCRIPT_OPTS=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --queue=*)       QUEUE="${1#*=}" ;;
-        --venv=*)        VENV="${1#*=}" ;;
+        --venv=*)        VENV="${1#*=}"
+                         case "$VENV" in "~"|"~/"*) VENV="$HOME${VENV#\~}" ;; esac ;;   # bash won't expand ~ after =
         --script=*)      SCRIPT="${1#*=}" ;;
         --job-name=*)    JOB_NAME="${1#*=}" ;;
         --walltime=*)    WALLTIME="${1#*=}" ;;
@@ -49,7 +50,7 @@ while [ $# -gt 0 ]; do
         --max-steps=*)   SCRIPT_OPTS+=("--max-steps" "${1#*=}") ;;
         --epochs=*)      SCRIPT_OPTS+=("--epochs" "${1#*=}") ;;
         --)              shift; PASS_ARGS=("$@"); break ;;
-        -h|--help)       sed -n '2,32p' "$0"; exit 0 ;;
+        -h|--help)       sed -n '2,24p' "$0"; exit 0 ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
     shift
@@ -58,6 +59,17 @@ done
 case "$QUEUE" in
     gpu_h100|gpu_h200|gpu_b300) ;;
     *) echo "WARNING: '$QUEUE' is not an 80 GB-class GPU queue — Gemma-4-26B 16-bit may not fit." >&2 ;;
+esac
+
+# Shell-quote the script args so values with spaces/quotes survive the bash -c below
+ALL_ARGS=(${SCRIPT_OPTS[@]+"${SCRIPT_OPTS[@]}"} ${PASS_ARGS[@]+"${PASS_ARGS[@]}"})
+ARGS_Q=""
+[ ${#ALL_ARGS[@]} -gt 0 ] && ARGS_Q=$(printf '%q ' "${ALL_ARGS[@]}")
+
+# The script's default --max-steps=60 overrides --epochs unless --max-steps=-1 is passed
+case " ${ALL_ARGS[*]:-} " in
+    *" --max-steps"*) ;;
+    *" --epochs"*) echo "WARNING: --epochs has no effect unless you also pass --max-steps=-1 (default is 60 steps)." >&2 ;;
 esac
 
 REPO_ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel 2>/dev/null || echo "$(cd "$(dirname "$0")/.." && pwd)")"
@@ -82,5 +94,5 @@ bsub -q "$QUEUE" -J "$JOB_NAME" -n "$CPUS" \
         source '$VENV/bin/activate'
         cd '$(cd "$(dirname "$0")" && pwd)'
         echo \"HOST \$(hostname -s); GPU:\"; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
-        python '$SCRIPT' ${SCRIPT_OPTS[*]:-} ${PASS_ARGS[*]:-}
+        python '$SCRIPT' ${ARGS_Q}
      "

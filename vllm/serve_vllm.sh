@@ -84,7 +84,7 @@ while [[ $# -gt 0 ]]; do
     --webui-queue=*) WEBUI_QUEUE="${1#*=}"; shift ;;   --webui-queue) WEBUI_QUEUE="$2"; shift 2 ;;
     --webui-port=*) WEBUI_PORT="${1#*=}"; shift ;;     --webui-port) WEBUI_PORT="$2"; shift 2 ;;
     --domain=*) DOMAIN="${1#*=}"; shift ;;             --domain) DOMAIN="$2"; shift 2 ;;
-    -h|--help) sed -n '2,58p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,47p' "$0"; exit 0 ;;
     *) echo "Unknown option: $1" >&2; exit 1 ;;
   esac
 done
@@ -194,6 +194,13 @@ echo "[info] model size: $(du -sh __MODEL__ 2>/dev/null | cut -f1)"
 
 VLLM_ARGS="__VLLM_ARGS__"
 
+# Fail fast if something on this node already listens on the port: otherwise the
+# /health wait below would "succeed" against that other server, not ours.
+if (exec 3<>/dev/tcp/127.0.0.1/__PORT__) 2>/dev/null; then
+    echo "[ERROR] port __PORT__ is already in use on $(hostname -s) (another server on this shared node?) — resubmit with a different --port"
+    exit 1
+fi
+
 if [ "__ENGINE__" = "apptainer" ]; then
     [ -r "__SIF__" ] || { echo "[ERROR] SIF not readable: __SIF__"; exit 1; }
     T_LAUNCH=$(date +%s); echo "[timing] launch_epoch=$T_LAUNCH"
@@ -210,15 +217,17 @@ elif [ "__ENGINE__" = "podman" ]; then
     mkdir -p /scratch/$USER/podman-run /scratch/$USER/podman-storage
     podman system migrate 2>/dev/null || true
     podman info >/dev/null 2>&1 || { echo "[podman] resetting"; podman system reset -f; }
-    trap 'podman rm -f __JOB_NAME__ 2>/dev/null; pkill -u $USER catatonit 2>/dev/null' EXIT
+    CTR=__JOB_NAME___${LSB_JOBID}   # per-job name: a second job on this node can't clash with / remove ours
+    # only reap the rootless pause process (catatonit) when no other container of ours is left on the node
+    trap 'podman rm -f "$CTR" 2>/dev/null; [ -n "$(podman ps -q 2>/dev/null)" ] || pkill -u $USER catatonit 2>/dev/null' EXIT
     T_LAUNCH=$(date +%s); echo "[timing] launch_epoch=$T_LAUNCH"
     podman pull "__IMAGE__"
-    podman run -d --name __JOB_NAME__ --device nvidia.com/gpu=all --ipc=host \
+    podman run -d --name "$CTR" --device nvidia.com/gpu=all --ipc=host \
         -v __MODEL__:/model:ro -p __PORT__:__PORT__ \
         -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e VLLM_LOGGING_LEVEL=INFO \
         --entrypoint vllm "__IMAGE__" serve /model $VLLM_ARGS
-    podman logs -f __JOB_NAME__ > "$CTR_LOG" 2>&1 &
-    ALIVE(){ [ "$(podman inspect -f '{{.State.Running}}' __JOB_NAME__ 2>/dev/null)" = "true" ]; }; STOP(){ podman rm -f __JOB_NAME__ 2>/dev/null||true; }
+    podman logs -f "$CTR" > "$CTR_LOG" 2>&1 &
+    ALIVE(){ [ "$(podman inspect -f '{{.State.Running}}' "$CTR" 2>/dev/null)" = "true" ]; }; STOP(){ podman rm -f "$CTR" 2>/dev/null||true; }
 
 else  # venv
     [ -f "__VENV__/bin/activate" ] || { echo "[ERROR] venv not found: __VENV__"; exit 1; }
@@ -249,9 +258,9 @@ grep -iE "loading (model )?weights took|Model loading took" "$CTR_LOG" | head -1
 echo "================================================================"
 echo "[test] endpoint tests (models / chat / reasoning / tools)"
 python3 "__TEST_SCRIPT__" --url "http://127.0.0.1:__PORT__" --model "__SERVED_NAME__" __TOOLS_FLAG__ \
-  || echo "[test] endpoint test FAILED (see $CTR_LOG)"
+  && TEST_RC=0 || { TEST_RC=1; echo "[test] endpoint test FAILED (see $CTR_LOG)"; }
 
-if [ "__EXIT_AFTER_TEST__" = "true" ]; then echo "[info] --exit-after-test; stopping."; STOP
+if [ "__EXIT_AFTER_TEST__" = "true" ]; then echo "[info] --exit-after-test; stopping."; STOP; exit $TEST_RC
 else echo "[info] live at http://$(hostname -s)__DOMAIN__:__PORT__/v1  (model: __SERVED_NAME__)"; echo "[info] bkill $LSB_JOBID to stop."; wait; fi
 BODY_STATIC
 } > "$JOBFILE"
@@ -267,16 +276,19 @@ sed -i \
   -e "s|__TEST_SCRIPT__|${TEST_SCRIPT}|g" -e "s|__TOOLS_FLAG__|${TOOLS_FLAG}|g" \
   "$JOBFILE"
 
-SUBMIT=$(bsub < "$JOBFILE"); echo "$SUBMIT"; rm -f "$JOBFILE"
-JOBID=$(echo "$SUBMIT" | grep -oE 'Job <[0-9]+>' | grep -oE '[0-9]+' | head -1)
+SUBMIT=$(bsub < "$JOBFILE") || { rm -f "$JOBFILE"; echo "ERROR: bsub submission failed" >&2; exit 1; }
+echo "$SUBMIT"; rm -f "$JOBFILE"
+# "|| true": under set -e/pipefail a non-matching grep (or a transient bjobs error below) would abort silently
+JOBID=$(echo "$SUBMIT" | grep -oE 'Job <[0-9]+>' | grep -oE '[0-9]+' | head -1 || true)
+[ -n "$JOBID" ] || { echo "ERROR: could not parse a job id from the bsub output" >&2; exit 1; }
 
 # ----- optional: launch Open WebUI pointed at wherever the model landed -----
 if [ "$WEBUI" = true ] && [ -n "$JOBID" ]; then
     echo -n "Waiting for model job $JOBID to reach a node"
     NODE=""
     for i in $(seq 1 200); do
-        st=$(bjobs -o "stat" "$JOBID" 2>/dev/null | tail -1 | tr -d ' ')
-        if [ "$st" = "RUN" ]; then NODE=$(bjobs -o "exec_host" "$JOBID" 2>/dev/null | tail -1 | tr -d ' ' | sed 's/^[0-9]*\*//; s/:.*//'); break; fi
+        st=$(bjobs -o "stat" "$JOBID" 2>/dev/null | tail -1 | tr -d ' ' || true)
+        if [ "$st" = "RUN" ]; then NODE=$(bjobs -o "exec_host" "$JOBID" 2>/dev/null | tail -1 | tr -d ' ' | sed 's/^[0-9]*\*//; s/:.*//' || true); break; fi
         { [ "$st" = "EXIT" ] || [ "$st" = "DONE" ]; } && { echo; echo "model job $st before starting; not launching webui"; exit 1; }
         echo -n "."; sleep 3
     done; echo
