@@ -62,7 +62,14 @@ BLOCK_SIZE = 1024
 
 print("Step 1/4: Downloading OpenWebText from HuggingFace...")
 from datasets import load_dataset
-dataset = load_dataset("openwebtext", trust_remote_code=True)
+# The Hub repo ships parquet shards (config plain_text, split train, column
+# text), so no dataset loading script / trust_remote_code is needed.
+try:
+    dataset = load_dataset("Skylion007/openwebtext")
+except Exception as e:
+    raise SystemExit(
+        f"ERROR: could not load Skylion007/openwebtext from the Hugging Face Hub: {e}\n"
+        "Check network access from the compute node and 'pip install -U datasets'.")
 print(f"  Downloaded: {len(dataset['train'])} documents")
 
 print("Step 2/4: Tokenizing with GPT-2 BPE tokenizer...")

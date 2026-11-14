@@ -311,7 +311,8 @@ def main():
             "epochs":            args.epochs,
             "num_nodes":         args.num_nodes,
             "save_models":       args.save_models,
-            "resume_checkpoint": args.resume,
+            "resume_checkpoint": (os.path.abspath(args.resume)
+                                  if args.resume else None),
             "model_dir":         model_dir,
             "log_path":          log_path,
         },

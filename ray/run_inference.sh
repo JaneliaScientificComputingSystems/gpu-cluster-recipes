@@ -9,7 +9,7 @@
 #   ./run_inference.sh --script=imagenet_classifier.py -- --model ../models/resnet50_imagenet_best.pth --test
 #
 # Options:
-#   --queue=QUEUE    GPU queue (default: gpu_l4)
+#   --queue=QUEUE    GPU queue (default: gpu_l4; not a *_parallel queue)
 #   --venv=PATH      Python venv path
 #   --script=FILE    Inference script to run
 #
@@ -51,28 +51,24 @@ OUTPUT_DIR="${SCRIPT_DIR}/../output"
 mkdir -p "$OUTPUT_DIR"
 SCRIPT_NAME=$(basename "$PYTHON_SCRIPT" .py)
 
-# Set app profile based on queue
+# Site policy: *_parallel queues allocate whole nodes and are for multi-node
+# jobs only — never a 1-GPU inference job. App profiles (-app) belong to those
+# queues, so none is set here (same as submit_ray_job.sh for these queues).
 case $QUEUE_NAME in
-    gpu_h200*|gpu_h100*) APP_PROFILE="parallel-96" ;;
-    gpu_l4_parallel)     APP_PROFILE="parallel-64" ;;
-    gpu_a100_parallel)   APP_PROFILE="parallel-48" ;;
-    *)                   APP_PROFILE="" ;;
+    *_parallel)
+        echo "ERROR: $QUEUE_NAME is a whole-node parallel queue; use ${QUEUE_NAME%_parallel} for single-GPU inference."
+        exit 1 ;;
 esac
 
 echo "Submitting: $PYTHON_SCRIPT $SCRIPT_ARGS"
 echo "Queue: $QUEUE_NAME (1 GPU)"
-
-APP_LINE=""
-if [ -n "$APP_PROFILE" ]; then
-    APP_LINE="#BSUB -app ${APP_PROFILE}"
-fi
 
 cat << EOF | bsub
 #!/bin/bash
 #BSUB -J ${SCRIPT_NAME}
 #BSUB -n 8
 #BSUB -q ${QUEUE_NAME}
-${APP_LINE}
+#BSUB -R "span[hosts=1]"
 #BSUB -gpu "num=1:mode=exclusive_process"
 #BSUB -o ${OUTPUT_DIR}/${SCRIPT_NAME}_%J.out
 #BSUB -e ${OUTPUT_DIR}/${SCRIPT_NAME}_%J.err

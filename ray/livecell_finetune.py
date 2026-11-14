@@ -638,7 +638,8 @@ def main():
             "eval_interval": args.eval_interval,
             "pretrained":    not args.no_pretrained,
             "save_models":       args.save_models,
-            "resume_checkpoint": args.resume,
+            "resume_checkpoint": (os.path.abspath(args.resume)
+                                  if args.resume else None),
             "model_dir":         model_dir,
         },
         datasets={"train": train_ds, "val": val_ds},

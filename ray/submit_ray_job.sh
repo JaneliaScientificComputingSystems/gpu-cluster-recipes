@@ -7,7 +7,7 @@
 #   ./submit_ray_job.sh <num_nodes> --script=SCRIPT [options] [-- script_args...]
 #
 # Examples:
-#   # Multi-node on parallel queues (whole nodes, all GPUs):
+#   # Multi-node on parallel queues (whole nodes, all GPUs, 2+ nodes):
 #   ./submit_ray_job.sh 2 --script=test_ray_cluster.py
 #   ./submit_ray_job.sh 8 --queue=gpu_b300_parallel --venv=~/ray_env \
 #       --script=train_ray.py -- --epochs=50
@@ -16,19 +16,25 @@
 #   ./submit_ray_job.sh 1 --queue=gpu_h100 --num-gpus=2 --venv=~/ray_env \
 #       --script=train_ray.py -- --epochs=20
 #
-# Parallel queues (whole nodes, multi-node):
+# Parallel queues (whole nodes, 2 or more nodes — never single-node jobs):
 #   gpu_b300_parallel  -> 96 CPUs, 8 GPUs, InfiniBand NCCL
 #   gpu_h200_parallel  -> 96 CPUs, 8 GPUs, InfiniBand NCCL
 #   gpu_h100_parallel  -> 96 CPUs, 8 GPUs, InfiniBand NCCL  [default]
 #   gpu_l4_parallel    -> 64 CPUs, 8 GPUs, Ethernet NCCL
 #   gpu_a100_parallel  -> 48 CPUs, 4 GPUs, Ethernet NCCL
+#   gpu_rtx6000_parallel -> 128 CPUs, 8 GPUs, Ethernet NCCL
 #
 # Non-parallel queues (single node, flexible GPU count):
 #   gpu_b300           -> use --num-gpus=N (1-8), InfiniBand NCCL
 #   gpu_h200           -> use --num-gpus=N (1-8), InfiniBand NCCL
 #   gpu_h100           -> use --num-gpus=N (1-8), InfiniBand NCCL
 #   gpu_l4             -> use --num-gpus=N (1-8), Ethernet NCCL
+#   gpu_l4_16          -> use --num-gpus=N (1-8), Ethernet NCCL
+#   gpu_l4_large       -> 1 GPU, Ethernet NCCL
+#   gpu_rtx6000        -> use --num-gpus=N (1-8), Ethernet NCCL
 #   gpu_a100           -> use --num-gpus=N (1-4), Ethernet NCCL
+# Default CPUs per GPU on non-parallel queues follow the site slot ratio:
+#   l4=8, l4_16=16, l4_large=64, rtx6000=16, a100/h100/h200/b300=12
 #===============================================================================
 
 usage() {
@@ -41,7 +47,7 @@ usage() {
     echo "Optional:"
     echo "  --queue=QUEUE        LSF queue (default: gpu_h100_parallel)"
     echo "  --num-gpus=N         GPUs to request (non-parallel queues, default: 1)"
-    echo "  --num-cpus=N         CPUs to request (non-parallel queues, default: 12 per GPU)"
+    echo "  --num-cpus=N         CPUs to request (non-parallel queues, default: queue's slots per GPU)"
     echo "  --job-name=NAME      Job name (default: ray_job)"
     echo "  --walltime=TIME      Walltime in hours (default: 24:00 non-parallel, auto parallel)"
     echo "  --venv=PATH          Python venv path"
@@ -105,8 +111,14 @@ case $QUEUE_NAME in
         APP_PROFILE="parallel-48"
         NETWORK_BACKEND="ETH"
         ;;
+    gpu_rtx6000_parallel)
+        CPUS_PER_NODE=128
+        GPUS_PER_NODE=8
+        APP_PROFILE="parallel-128"
+        NETWORK_BACKEND="ETH"
+        ;;
     # Non-parallel queues — single node, flexible GPU count
-    # Defaults: 1 GPU, 12 CPUs per GPU, 24h walltime
+    # Defaults: 1 GPU, the queue's slots-per-GPU ratio, 24h walltime
     gpu_b300|gpu_h200|gpu_h100)
         PARALLEL_QUEUE=false
         GPUS_PER_NODE=${USER_NUM_GPUS:-1}
@@ -114,10 +126,24 @@ case $QUEUE_NAME in
         APP_PROFILE=""
         NETWORK_BACKEND="IB"
         ;;
-    gpu_l4|gpu_l4_large|gpu_l4_16)
+    gpu_l4)
         PARALLEL_QUEUE=false
         GPUS_PER_NODE=${USER_NUM_GPUS:-1}
         CPUS_PER_NODE=${USER_NUM_CPUS:-$((GPUS_PER_NODE * 8))}
+        APP_PROFILE=""
+        NETWORK_BACKEND="ETH"
+        ;;
+    gpu_l4_16|gpu_rtx6000)
+        PARALLEL_QUEUE=false
+        GPUS_PER_NODE=${USER_NUM_GPUS:-1}
+        CPUS_PER_NODE=${USER_NUM_CPUS:-$((GPUS_PER_NODE * 16))}
+        APP_PROFILE=""
+        NETWORK_BACKEND="ETH"
+        ;;
+    gpu_l4_large)
+        PARALLEL_QUEUE=false
+        GPUS_PER_NODE=${USER_NUM_GPUS:-1}
+        CPUS_PER_NODE=${USER_NUM_CPUS:-$((GPUS_PER_NODE * 64))}
         APP_PROFILE=""
         NETWORK_BACKEND="ETH"
         ;;
@@ -130,14 +156,22 @@ case $QUEUE_NAME in
         ;;
     *)
         echo "ERROR: Unsupported queue: $QUEUE_NAME"
-        echo "Parallel:     gpu_b300_parallel, gpu_h200_parallel, gpu_h100_parallel, gpu_l4_parallel, gpu_a100_parallel"
-        echo "Non-parallel: gpu_b300, gpu_h200, gpu_h100, gpu_l4, gpu_a100 (use --num-gpus=N)"
+        echo "Parallel:     gpu_b300_parallel, gpu_h200_parallel, gpu_h100_parallel, gpu_l4_parallel, gpu_a100_parallel, gpu_rtx6000_parallel"
+        echo "Non-parallel: gpu_b300, gpu_h200, gpu_h100, gpu_l4, gpu_l4_16, gpu_l4_large, gpu_rtx6000, gpu_a100 (use --num-gpus=N)"
         exit 1
         ;;
 esac
 
 if [ "$PARALLEL_QUEUE" = false ] && [ $NUM_NODES -gt 1 ]; then
     echo "ERROR: Non-parallel queues only support 1 node. Use a parallel queue for multi-node."
+    exit 1
+fi
+
+# Site policy: *_parallel queues are for multi-node jobs only (they allocate
+# whole nodes without CPU fencing or memory limits).
+if [ "$PARALLEL_QUEUE" = true ] && [ $NUM_NODES -lt 2 ]; then
+    echo "ERROR: $QUEUE_NAME is a parallel queue — never submit single-node jobs to it."
+    echo "       For one node use ${QUEUE_NAME%_parallel} with --num-gpus=N (up to ${GPUS_PER_NODE})."
     exit 1
 fi
 
@@ -172,6 +206,14 @@ if [ -n "$APP_PROFILE" ]; then
 fi
 if [ "$PARALLEL_QUEUE" = true ]; then
     SPAN_LINE="#BSUB -R \"span[ptile=${CPUS_PER_NODE}]\""
+    # Whole nodes are ours alone: safe to clear any stale Ray daemon left on
+    # the node by a prior job before starting.
+    STALE_STOP="ray stop --force >/dev/null 2>&1 || true"
+else
+    # Single-node job on a shared node: all slots must be on one host, and
+    # other Ray clusters on that host (ours or not) must be left alone.
+    SPAN_LINE="#BSUB -R \"span[hosts=1]\""
+    STALE_STOP=":"
 fi
 
 # NCCL env file path (for IB queues)
@@ -225,19 +267,18 @@ else
     export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 fi
 
-# Whole-node (parallel) queues use all GPUs 0-7. On non-parallel queues the
-# node is shared: keep the GPUs LSF assigned instead of the 0-7 set above.
+# LSF sets CUDA_VISIBLE_DEVICES to the GPUs it assigned; site policy is not to
+# override it, so its value replaces the 0-7 set above on every queue. Only if
+# LSF set none: whole-node (parallel) jobs keep 0-7, shared-node jobs get none.
 # GPU_ENV_FIX is re-applied in the ray start shells after they source the
 # NCCL env file.
 GPU_ENV_FIX=":"
-if [ "${PARALLEL_QUEUE}" != true ]; then
-    if [ -n "\$LSF_CUDA_VISIBLE_DEVICES" ]; then
-        GPU_ENV_FIX="export CUDA_VISIBLE_DEVICES=\$LSF_CUDA_VISIBLE_DEVICES"
-    else
-        GPU_ENV_FIX="unset CUDA_VISIBLE_DEVICES"
-    fi
-    \$GPU_ENV_FIX
+if [ -n "\$LSF_CUDA_VISIBLE_DEVICES" ]; then
+    GPU_ENV_FIX="export CUDA_VISIBLE_DEVICES=\$LSF_CUDA_VISIBLE_DEVICES"
+elif [ "${PARALLEL_QUEUE}" != true ]; then
+    GPU_ENV_FIX="unset CUDA_VISIBLE_DEVICES"
 fi
+\$GPU_ENV_FIX
 
 # Per-job temp dir so concurrent/back-to-back jobs never share Ray session state
 export RAY_TMPDIR="/scratch/\$(whoami)/ray_\$(whoami)_\${LSB_JOBID}"
@@ -246,11 +287,62 @@ mkdir -p \$RAY_TMPDIR
 function getfreeport() {
     CHECK="do while"
     while [[ ! -z \$CHECK ]]; do
-        port=\$(( ( RANDOM % 40000 ) + 20000 ))
+        port=\$(( ( RANDOM % 28000 ) + 32000 ))
         CHECK=\$(ss -tln | grep ":\$port ")
     done
     echo \$port
 }
+
+# Tag exported only in the 'ray start' shells. Every Ray daemon of this job
+# inherits it, which is how stop_job_ray finds them without touching any other
+# Ray cluster the same user has on a shared node.
+RAY_JOB_TAG="lsf_\${LSB_JOBID}"
+
+# Stop the Ray processes of ONE job on the local host and remove its temp dir.
+# Matches the per-job temp dir in the command line (gcs_server, raylet,
+# dashboard, agents, log monitor) or the job tag in the process environment;
+# Ray worker processes exit on their own once their raylet is gone.
+# Shipped to each host with 'declare -f' — a plain 'ray stop' would kill every
+# Ray process the user owns on that host, including other jobs' clusters.
+function stop_job_ray() {
+    local tmpdir=\$1 tag=\$2 pids sig i
+    for sig in TERM KILL; do
+        pids=\$( { pgrep -u \$(id -u) -f "\$tmpdir/sessio[n]_"
+                  grep -lsz "^LSF_RAY_JOB_TAG=\$tag\\\$" /proc/[0-9]*/environ | cut -d/ -f3
+                } | sort -u )
+        [ -z "\$pids" ] && break
+        kill -\$sig \$pids 2>/dev/null
+        if [ \$sig = TERM ]; then
+            for i in 1 2 3 4 5 6 7 8 9 10; do
+                kill -0 \$pids 2>/dev/null || break
+                sleep 1
+            done
+        fi
+    done
+    rm -rf "\$tmpdir"
+}
+
+# Per-job Ray ports, identical on every host of the job, so two clusters on a
+# shared node do not collide on fixed defaults. A block of 10 ports in
+# 20000-31999 is derived from the job ID and moved on if busy on this host.
+# (The head/GCS port from getfreeport is drawn from 32000-59999.)
+function ports_free() {
+    local p
+    for p in "\$@"; do
+        ss -tln 2>/dev/null | grep -q ":\$p " && return 1
+    done
+    return 0
+}
+port_block=\$(( \${LSB_JOBID:-0} % 1200 ))
+for try in 1 2 3 4 5 6 7 8 9 10; do
+    port_base=\$(( 20000 + port_block * 10 ))
+    ports_free \$((port_base + 1)) \$((port_base + 2)) \$((port_base + 3)) \$((port_base + 4)) && break
+    port_block=\$(( (port_block + 7) % 1200 ))
+done
+agent_grpc_port=\$((port_base + 1))
+agent_listen_port=\$((port_base + 2))
+dashboard_port=\$((port_base + 3))
+client_server_port=\$((port_base + 4))
 
 hosts=()
 for host in \$(cat \$LSB_DJOB_HOSTFILE | uniq); do
@@ -272,7 +364,7 @@ function cleanup() {
     [ \$cleanup_done -eq 1 ] && return
     cleanup_done=1
     for host in "\${hosts[@]}"; do
-        blaunch -z \$host "if [ -n '${VENV_PATH}' ]; then source ${VENV_PATH}/bin/activate; fi; ray stop >/dev/null 2>&1; rm -rf \$RAY_TMPDIR" &
+        blaunch -z \$host "\$(declare -f stop_job_ray); stop_job_ray '\$RAY_TMPDIR' '\$RAY_JOB_TAG'" &
     done
     wait
     echo "Ray cluster stopped"
@@ -304,6 +396,7 @@ port=\$(getfreeport)
 head_node=\${hosts[0]}
 echo ""
 echo "Head node: \$head_node  Port: \$port"
+echo "Per-job Ray ports: agent \$agent_grpc_port/\$agent_listen_port  dashboard \$dashboard_port  client server \$client_server_port"
 
 # Path to NCCL env file — sourced by ray start shells so the daemon
 # (and all workers it spawns) inherit the vars.
@@ -319,13 +412,16 @@ blaunch -z \$head_node "
     export PYTHONUNBUFFERED=1
     if [ -n '\$NCCL_ENV_FILE' ] && [ -f '\$NCCL_ENV_FILE' ]; then source \$NCCL_ENV_FILE; fi
     \$GPU_ENV_FIX
-    ray stop --force >/dev/null 2>&1 || true   # clear any stale Ray daemon left on this node by a prior job
+    export LSF_RAY_JOB_TAG=\$RAY_JOB_TAG
+    ${STALE_STOP}
     ray start --head --port \$port \
         --num-cpus=${CPUS_PER_NODE} \
         --num-gpus=${GPUS_PER_NODE} \
         --temp-dir=\$RAY_TMPDIR \
-        --dashboard-agent-grpc-port=20100 \
-        --dashboard-agent-listen-port=20101
+        --dashboard-port=\$dashboard_port \
+        --ray-client-server-port=\$client_server_port \
+        --dashboard-agent-grpc-port=\$agent_grpc_port \
+        --dashboard-agent-listen-port=\$agent_listen_port
 " &
 
 sleep 20
@@ -360,13 +456,14 @@ if [ ${NUM_NODES} -gt 1 ]; then
             export PYTHONUNBUFFERED=1
             if [ -n '\$NCCL_ENV_FILE' ] && [ -f '\$NCCL_ENV_FILE' ]; then source \$NCCL_ENV_FILE; fi
             \$GPU_ENV_FIX
-            ray stop --force >/dev/null 2>&1 || true   # clear any stale Ray daemon left on this node by a prior job
+            export LSF_RAY_JOB_TAG=\$RAY_JOB_TAG
+            ${STALE_STOP}
             ray start --address \$head_node:\$port \
                 --num-cpus=${CPUS_PER_NODE} \
                 --num-gpus=${GPUS_PER_NODE} \
                 --temp-dir=\$RAY_TMPDIR \
-                --dashboard-agent-grpc-port=20100 \
-                --dashboard-agent-listen-port=20101
+                --dashboard-agent-grpc-port=\$agent_grpc_port \
+                --dashboard-agent-listen-port=\$agent_listen_port
         " &
         sleep 10
         waited=10

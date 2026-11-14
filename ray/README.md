@@ -25,6 +25,8 @@ Six ready-to-run examples:
 | `gpu_h200_parallel` | H200 | 8 | InfiniBand NDR 400 Gb/s | 96 |
 | `gpu_h100_parallel` | H100 | 8 | InfiniBand NDR 400 Gb/s | 96 |
 
+Parallel queues are for jobs of 2 or more whole nodes. Site policy: never submit a single-node or partial-node job to a `*_parallel` queue — `submit_ray_job.sh` and `run_inference.sh` refuse it. `gpu_l4_parallel`, `gpu_a100_parallel` and `gpu_rtx6000_parallel` (Ethernet) are also supported.
+
 **Non-parallel queues** — single node, request 1-8 GPUs with `--num-gpus`:
 
 | Queue | GPU | Max GPUs | Network |
@@ -33,6 +35,8 @@ Six ready-to-run examples:
 | `gpu_h100` | H100 | 8 | InfiniBand NDR 400 Gb/s |
 | `gpu_h200` | H200 | 8 | InfiniBand NDR 400 Gb/s |
 | `gpu_l4` | L4 | 8 | Ethernet |
+| `gpu_l4_16` | L4 | 8 | Ethernet |
+| `gpu_rtx6000` | RTX PRO 6000 | 8 | Ethernet |
 | `gpu_a100` | A100 | 4 | Ethernet |
 
 **CPU queue** — multi-node, no GPUs:
@@ -40,6 +44,8 @@ Six ready-to-run examples:
 | Queue | Network | CPUs/node |
 |-------|---------|-----------|
 | `cpu_parallel` | Ethernet | 128 |
+
+`cpu_parallel` allocates whole nodes only: request CPUs in multiples of 128. For smaller jobs use `--queue=local` (or `--queue=short`, 1 hour max).
 
 ---
 
@@ -97,7 +103,8 @@ pip install scipy scikit-image pycocotools
 Options:
   --queue=QUEUE        GPU queue (default: gpu_h100_parallel)
   --num-gpus=N         GPUs per node (non-parallel queues, default: 1)
-  --num-cpus=N         CPUs to request (non-parallel queues, default: 12 per GPU)
+  --num-cpus=N         CPUs to request (non-parallel queues, default: the queue's slots per GPU —
+                       l4=8, l4_16/rtx6000=16, a100/h100/h200/b300=12)
   --venv=PATH          Python venv path
   --job-name=NAME      Job name (default: ray_job)
   --walltime=TIME      Walltime (default: 24h non-parallel, 4-8h parallel)
@@ -106,7 +113,7 @@ Script args go after '--':
   ./submit_ray_job.sh 2 --script=train.py -- --epochs=50
 ```
 
-**Multi-node** (parallel queues — whole nodes, all GPUs):
+**Multi-node** (parallel queues — whole nodes, all GPUs, 2 or more nodes):
 ```bash
 ./submit_ray_job.sh 2 --queue=gpu_h100_parallel --venv=~/ray_env \
     --script=train.py -- --num-gpus=16 --num-nodes=2
@@ -126,18 +133,18 @@ For CPU-only workloads (data pipelines, ETL, analysis) — no GPUs:
 ./submit_ray_cpu_job.sh --num-cpus=N --script=SCRIPT [options] [-- script_args...]
 
 Options:
-  --num-cpus=N         Total CPUs to request (required)
+  --num-cpus=N         Total CPUs to request (required; multiple of 128 on cpu_parallel)
   --script=FILE        Python script to run (required)
   --queue=QUEUE        LSF queue (default: cpu_parallel)
   --venv=PATH          Python venv path
   --job-name=NAME      Job name (default: ray_cpu_job)
-  --walltime=TIME      Walltime HH:MM (default: 24:00)
+  --walltime=TIME      Walltime HH:MM (default: 24:00, 1:00 on short)
 
 Script args go after '--':
-  ./submit_ray_cpu_job.sh --num-cpus=200 --script=pipeline.py -- --input /data
+  ./submit_ray_cpu_job.sh --num-cpus=256 --script=pipeline.py -- --input /data
 ```
 
-LSF decides how to distribute CPUs across nodes. The script discovers the allocation at runtime and starts Ray accordingly.
+On `cpu_parallel` each 128 CPUs is one whole node. The script discovers the allocation at runtime and starts Ray accordingly.
 
 ```bash
 # Search your sequences against UniRef90
@@ -148,8 +155,8 @@ LSF decides how to distribute CPUs across nodes. The script discovers the alloca
 ./submit_ray_cpu_job.sh --num-cpus=128 --venv=~/ray_env \
     --script=sequence_search.py -- --test
 
-# Multi-node — 200 CPUs for faster search
-./submit_ray_cpu_job.sh --num-cpus=200 --venv=~/ray_env \
+# Multi-node — 256 CPUs (2 nodes) for faster search
+./submit_ray_cpu_job.sh --num-cpus=256 --venv=~/ray_env \
     --script=sequence_search.py -- --query my_proteins.fasta --top-n=20
 ```
 
@@ -224,7 +231,7 @@ Give the classifier an image — it returns the top-3 predicted CIFAR-10 categor
 
 ### About the dataset
 
-[OpenWebText](https://huggingface.co/datasets/openwebtext) is a reproduction of the WebText corpus used to train the original GPT-2. It contains ~8 million web pages scraped from URLs shared on Reddit with at least 3 karma. The text is tokenized with GPT-2's BPE tokenizer (50,257 token vocabulary) into ~4.5 billion tokens. A 0.05% held-out validation split is used for perplexity evaluation.
+[OpenWebText](https://huggingface.co/datasets/Skylion007/openwebtext) is a reproduction of the WebText corpus used to train the original GPT-2. It contains ~8 million web pages scraped from URLs shared on Reddit with at least 3 karma. The text is tokenized with GPT-2's BPE tokenizer (50,257 token vocabulary) into ~4.5 billion tokens. A 0.05% held-out validation split is used for perplexity evaluation.
 
 ### Model sizes
 
@@ -562,7 +569,7 @@ The mask preprocessing converts COCO instance annotations into per-pixel semanti
     --num-gpus=16 --num-nodes=2 --epochs=50 --batch-size=4 --save-models
 
 # Single A100 node (4 GPUs) — good for development
-./submit_ray_job.sh 1 --queue=gpu_a100_parallel --venv=~/ray_env \
+./submit_ray_job.sh 1 --queue=gpu_a100 --num-gpus=4 --venv=~/ray_env \
     --job-name=livecell \
     --script=livecell_finetune.py -- \
     --num-gpus=4 --num-nodes=1 --epochs=50 --batch-size=4 --save-models
@@ -634,8 +641,8 @@ UniRef90 is pre-installed at `/misc/blast/db/uniref90/uniref90.fasta` (28 GB, 83
 ./submit_ray_cpu_job.sh --num-cpus=128 --venv=~/ray_env \
     --script=sequence_search.py -- --query my_proteins.fasta
 
-# Multi-node — 200 CPUs for faster search
-./submit_ray_cpu_job.sh --num-cpus=200 --venv=~/ray_env \
+# Multi-node — 256 CPUs (2 nodes) for faster search
+./submit_ray_cpu_job.sh --num-cpus=256 --venv=~/ray_env \
     --job-name=seq_search \
     --script=sequence_search.py -- --query my_proteins.fasta --top-n=20
 ```
@@ -685,10 +692,22 @@ Checkpoints: `--save-models` saves `<model>_latest.pth` (every epoch) and `<mode
 
 ## Monitoring
 
-Job output goes to `../output/` (relative to the directory you submit from; the submit scripts create it). On startup failure, `bkill` or walltime the submit scripts stop Ray and remove the per-job temp dir `/scratch/$USER/ray_$USER_<JOBID>` on every node:
+Job output goes to `../output/` (relative to the directory you submit from; the submit scripts create it). At job end — and on startup failure, `bkill` or walltime — the submit scripts stop only that job's Ray processes and remove its per-job temp dir `/scratch/$USER/ray_$USER_<JOBID>` on every node; other Ray clusters you have on a shared node are left running. Each job also uses its own block of Ray ports (printed as `Per-job Ray ports` in the `.out` file):
 
 ```bash
 bjobs                              # list jobs
 tail -f ../output/*_<JOBID>.out    # training output
 tail -f ../output/*_<JOBID>.err    # errors
 ```
+
+---
+
+## Known limitations
+
+**The Ray cluster has no authentication.** The submit scripts start Ray with its defaults, so the head port (printed as `Head node: <host>  Port: <port>` in the job output) accepts connections from any machine that can reach the node — and compute nodes are directly reachable by hostname from the internal network. Anyone on the cluster network who finds that port can attach to the cluster and run code as you for as long as the job lives. The random port is not a protection.
+
+What to do about it:
+
+- Treat a running Ray job like an open shell on the cluster network: do not put secrets (tokens, passwords) in the job environment or script arguments, and do not run it on data that other cluster users must not read.
+- Keep jobs no longer than needed. The cluster is torn down when the job ends, and `bkill <JOBID>` stops it at once.
+- Recent Ray releases have built-in token authentication. It is not enabled here because it depends on the installed Ray version; check the Ray security documentation for your version and, if supported, enable it on every node of the job (head and workers) — this has not been tested with these scripts.
