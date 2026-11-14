@@ -22,6 +22,7 @@ from ray.train import ScalingConfig, RunConfig
 from ray.train.torch import TorchTrainer
 
 from train_logging import make_log_path, MetricLogger
+from train_utils import global_sum
 
 
 def parse_args():
@@ -131,7 +132,7 @@ def transform_val_batch(batch):
 # Checkpoint
 # ---------------------------------------------------------------------------
 
-def save_checkpoint(model, optimizer, epoch, top1, top5, config,
+def save_checkpoint(model, optimizer, epoch, top1, top5, best_top1, config,
                     is_best=False, world_rank=0):
     if world_rank != 0:
         return
@@ -146,11 +147,15 @@ def save_checkpoint(model, optimizer, epoch, top1, top5, config,
         "optimizer_state_dict": optimizer.state_dict(),
         "top1_accuracy": top1,
         "top5_accuracy": top5,
+        "best_top1": best_top1,
     }, path)
     print(f"Checkpoint saved: {path}  (top1={top1:.2f}% top5={top5:.2f}%)")
 
 
-def load_checkpoint(path, model, optimizer, device):
+def load_checkpoint(path, model, optimizer, device, world_rank=0):
+    """Restore model and optimizer. Called on every rank: DDP syncs weights
+    only when it is constructed, so a rank-0-only load would leave the other
+    replicas at random init."""
     if not os.path.exists(path):
         raise FileNotFoundError(f"Checkpoint not found: {path}")
     ckpt = torch.load(path, map_location=device)
@@ -158,8 +163,12 @@ def load_checkpoint(path, model, optimizer, device):
     raw.load_state_dict(ckpt["model_state_dict"])
     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
     start_epoch = ckpt["epoch"] + 1
-    best_top1   = ckpt.get("top1_accuracy", 0)
-    print(f"Resumed from epoch {start_epoch}, best top1 {best_top1:.2f}%")
+    # "top1_accuracy" is the train accuracy in a *_latest checkpoint, so it
+    # cannot seed the best validation score. Checkpoints written before
+    # "best_top1" existed restart best tracking from 0.
+    best_top1   = float(ckpt.get("best_top1", 0.0))
+    if world_rank == 0:
+        print(f"Resumed from epoch {start_epoch}, best val top1 {best_top1:.2f}%")
     return start_epoch, best_top1
 
 
@@ -203,21 +212,14 @@ def train_func(config):
         momentum=config["momentum"], weight_decay=config["weight_decay"])
     criterion = nn.CrossEntropyLoss()
 
-    best_top1 = 0
+    best_top1 = 0.0
     start_epoch = 0
 
-    if config.get("resume_checkpoint") and world_rank == 0:
+    # Every rank loads the checkpoint (shared filesystem), so all replicas
+    # resume with the same weights and optimizer state.
+    if config.get("resume_checkpoint"):
         start_epoch, best_top1 = load_checkpoint(
-            config["resume_checkpoint"], model, optimizer, device)
-
-    if world_size > 1:
-        import torch.distributed as dist
-        se = torch.tensor(start_epoch, device=device)
-        bt = torch.tensor(best_top1,   device=device)
-        dist.broadcast(se, src=0)
-        dist.broadcast(bt, src=0)
-        start_epoch = int(se.item())
-        best_top1   = bt.item()
+            config["resume_checkpoint"], model, optimizer, device, world_rank)
 
     for epoch in range(start_epoch, config["epochs"]):
         model.train()
@@ -264,14 +266,17 @@ def train_func(config):
                            f"loss={loss.item():.4f} lr={lr:.5f} "
                            f"{img_sec:.0f} img/s")
 
-        train_loss = epoch_loss / max(num_batches, 1)
-        train_top1 = 100.0 * correct / max(total, 1)
+        # Global totals, not rank 0's share of the data
+        g_loss, g_batches, g_correct, g_total = global_sum(
+            [epoch_loss, num_batches, correct, total], device)
+        train_loss = g_loss / max(g_batches, 1)
+        train_top1 = 100.0 * g_correct / max(g_total, 1)
         elapsed = time.time() - t0
-        img_sec = images_processed * world_size / max(elapsed, 1)
+        img_sec = g_total / max(elapsed, 1)
 
         # Save latest checkpoint every epoch
         if config.get("save_models"):
-            save_checkpoint(model, optimizer, epoch, train_top1, 0,
+            save_checkpoint(model, optimizer, epoch, train_top1, 0, best_top1,
                             config, is_best=False, world_rank=world_rank)
 
         # Validation
@@ -296,18 +301,13 @@ def train_func(config):
                     val_correct5 += top5.item() * targets.size(0) / 100
                     val_total += targets.size(0)
 
+            # Sum counts across ranks so unequal or empty shards cannot
+            # skew the accuracy
+            val_correct1, val_correct5, val_total = global_sum(
+                [val_correct1, val_correct5, val_total], device)
             if val_total > 0:
                 val_top1 = 100.0 * val_correct1 / val_total
                 val_top5 = 100.0 * val_correct5 / val_total
-
-            if world_size > 1:
-                import torch.distributed as dist
-                t1 = torch.tensor(val_top1, device=device)
-                t5 = torch.tensor(val_top5, device=device)
-                dist.all_reduce(t1, op=dist.ReduceOp.AVG)
-                dist.all_reduce(t5, op=dist.ReduceOp.AVG)
-                val_top1 = t1.item()
-                val_top5 = t5.item()
 
             is_best = val_top1 > best_top1
             if is_best:
@@ -315,7 +315,8 @@ def train_func(config):
 
             if config.get("save_models") and is_best:
                 save_checkpoint(model, optimizer, epoch, val_top1, val_top5,
-                                config, is_best=True, world_rank=world_rank)
+                                best_top1, config, is_best=True,
+                                world_rank=world_rank)
 
         ray.train.report({
             "epoch": epoch, "train_loss": train_loss,
@@ -368,7 +369,8 @@ def main():
         return
     print(f"Found {len(train_files)} train shards, {len(val_files)} val shards")
 
-    train_ds = ray.data.read_parquet(train_files)
+    # Randomise shard order on each pass so epochs do not replay one order
+    train_ds = ray.data.read_parquet(train_files).randomize_block_order()
     val_ds = ray.data.read_parquet(val_files)
 
     # Apply transforms via map_batches

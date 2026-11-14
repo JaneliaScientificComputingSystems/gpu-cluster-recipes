@@ -16,6 +16,7 @@ from ray.train.torch import TorchTrainer
 
 from resnet18_cifar import ResNet18
 from train_logging import make_log_path, MetricLogger
+from train_utils import global_sum
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -102,8 +103,8 @@ def verify_ib_in_use():
         print(f"  OK   {eth_dev} (Ethernet) correctly excluded from NCCL_IB_HCA")
     print("-----------------------")
 
-def save_checkpoint(model, optimizer, epoch, train_acc, test_acc,
-                    config, is_best=False, world_rank=0):
+def save_checkpoint(model, optimizer, scheduler, epoch, train_acc, test_acc,
+                    best_test_acc, config, is_best=False, world_rank=0):
     if world_rank != 0:
         return None
     model_dir = config["model_dir"]
@@ -116,13 +117,18 @@ def save_checkpoint(model, optimizer, epoch, train_acc, test_acc,
         "epoch": epoch,
         "model_state_dict":     raw.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
         "train_accuracy":       train_acc,
         "test_accuracy":        test_acc,
+        "best_test_accuracy":   best_test_acc,
     }, path)
     print(f"Checkpoint saved: {path}  (test acc {test_acc:.2f}%)")
     return path
 
-def load_checkpoint(path, model, optimizer, device):
+def load_checkpoint(path, model, optimizer, scheduler, device, world_rank=0):
+    """Restore model, optimizer and LR schedule. Called on every rank: DDP
+    syncs weights only when it is constructed, so a rank-0-only load would
+    leave the other replicas at random init."""
     if not os.path.exists(path):
         raise FileNotFoundError(f"Checkpoint not found: {path}")
     ckpt = torch.load(path, map_location=device)
@@ -130,13 +136,22 @@ def load_checkpoint(path, model, optimizer, device):
     raw.load_state_dict(ckpt["model_state_dict"])
     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
     start_epoch   = ckpt["epoch"] + 1
-    best_test_acc = ckpt.get("test_accuracy", 0)
-    print(f"Resumed from epoch {start_epoch}, best acc {best_test_acc:.2f}%")
+    if "scheduler_state_dict" in ckpt:
+        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+    else:
+        # Older checkpoint: the optimizer state already holds the decayed LR,
+        # so only the schedule position needs to be moved forward.
+        scheduler.last_epoch = start_epoch
+        scheduler._last_lr = [pg["lr"] for pg in optimizer.param_groups]
+    # Older checkpoints only have the accuracy of the epoch they were saved at.
+    best_test_acc = float(ckpt.get("best_test_accuracy",
+                                   ckpt.get("test_accuracy", 0.0)))
+    if world_rank == 0:
+        print(f"Resumed from epoch {start_epoch}, best acc {best_test_acc:.2f}%")
     return start_epoch, best_test_acc
 
 def train_func(config):
     import ray.train
-    import torch.distributed as dist
 
     world_rank  = ray.train.get_context().get_world_rank()
     world_size  = ray.train.get_context().get_world_size()
@@ -170,20 +185,15 @@ def train_func(config):
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=config["epochs"])
 
-    best_test_acc = 0
+    best_test_acc = 0.0
     start_epoch   = 0
 
-    if config.get("resume_checkpoint") and world_rank == 0:
+    # Every rank loads the checkpoint (shared filesystem), so all replicas
+    # resume with the same weights, optimizer state and LR schedule.
+    if config.get("resume_checkpoint"):
         start_epoch, best_test_acc = load_checkpoint(
-            config["resume_checkpoint"], model, optimizer, device)
-
-    if world_size > 1:
-        se = torch.tensor(start_epoch,   device=device)
-        bt = torch.tensor(best_test_acc, device=device)
-        dist.broadcast(se, src=0)
-        dist.broadcast(bt, src=0)
-        start_epoch   = int(se.item())
-        best_test_acc = bt.item()
+            config["resume_checkpoint"], model, optimizer, scheduler,
+            device, world_rank)
 
     for epoch in range(start_epoch, config["epochs"]):
         model.train()
@@ -213,8 +223,11 @@ def train_func(config):
                            f"loss={loss.item():.4f}")
 
         scheduler.step()
-        train_loss = epoch_loss / len(trainloader)
-        train_acc  = 100. * correct / total
+        # Global totals, not rank 0's share of the data
+        g_loss, g_batches, g_correct, g_total = global_sum(
+            [epoch_loss, len(trainloader), correct, total], device)
+        train_loss = g_loss / max(g_batches, 1)
+        train_acc  = 100. * g_correct / max(g_total, 1)
 
         model.eval()
         test_loss = test_correct = test_total = 0
@@ -227,24 +240,23 @@ def train_func(config):
                 test_total   += targets.size(0)
                 test_correct += out.argmax(1).eq(targets).sum().item()
 
-        test_loss /= len(testloader)
-        test_acc   = 100. * test_correct / test_total
-
-        if world_size > 1:
-            ta = torch.tensor(test_acc, device=device)
-            dist.all_reduce(ta, op=dist.ReduceOp.AVG)
-            test_acc = ta.item()
+        g_loss, g_batches, g_correct, g_total = global_sum(
+            [test_loss, len(testloader), test_correct, test_total], device)
+        test_loss = g_loss / max(g_batches, 1)
+        test_acc  = 100. * g_correct / max(g_total, 1)
 
         is_best = test_acc > best_test_acc
         if is_best:
             best_test_acc = test_acc
 
         if config.get("save_models"):
-            save_checkpoint(model, optimizer, epoch, train_acc, test_acc,
-                            config, is_best=False, world_rank=world_rank)
+            save_checkpoint(model, optimizer, scheduler, epoch, train_acc,
+                            test_acc, best_test_acc, config,
+                            is_best=False, world_rank=world_rank)
             if is_best:
-                save_checkpoint(model, optimizer, epoch, train_acc, test_acc,
-                                config, is_best=True, world_rank=world_rank)
+                save_checkpoint(model, optimizer, scheduler, epoch, train_acc,
+                                test_acc, best_test_acc, config,
+                                is_best=True, world_rank=world_rank)
 
         ray.train.report({
             "epoch": epoch, "train_loss": train_loss, "train_acc": train_acc,

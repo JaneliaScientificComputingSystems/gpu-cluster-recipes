@@ -25,6 +25,8 @@ import torchvision.transforms.functional as TF
 from ray.train import ScalingConfig, RunConfig
 from ray.train.torch import TorchTrainer
 
+from train_utils import global_sum
+
 
 # ---------------------------------------------------------------------------
 # Segmentation model: Swin backbone + FPN decoder
@@ -305,7 +307,7 @@ def compute_iou(pred, target, num_classes=3):
 # Checkpoint
 # ---------------------------------------------------------------------------
 
-def save_checkpoint(model, optimizer, epoch, miou, config,
+def save_checkpoint(model, optimizer, epoch, miou, best_miou, config,
                     is_best=False, world_rank=0):
     if world_rank != 0:
         return
@@ -318,12 +320,16 @@ def save_checkpoint(model, optimizer, epoch, miou, config,
         "epoch": epoch,
         "model_state_dict": raw.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
-        "mean_iou": miou,
+        "mean_iou": float(miou),
+        "best_miou": float(best_miou),
     }, path)
     print(f"Checkpoint saved: {path}  (mIoU={miou:.4f})")
 
 
-def load_checkpoint(path, model, optimizer, device):
+def load_checkpoint(path, model, optimizer, device, world_rank=0):
+    """Restore model and optimizer. Called on every rank: DDP syncs weights
+    only when it is constructed, so a rank-0-only load would leave the other
+    replicas at random init."""
     if not os.path.exists(path):
         raise FileNotFoundError(f"Checkpoint not found: {path}")
     ckpt = torch.load(path, map_location=device)
@@ -331,8 +337,9 @@ def load_checkpoint(path, model, optimizer, device):
     raw.load_state_dict(ckpt["model_state_dict"])
     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
     start_epoch = ckpt["epoch"] + 1
-    best_miou = ckpt.get("mean_iou", 0)
-    print(f"Resumed from epoch {start_epoch}, best mIoU {best_miou:.4f}")
+    best_miou = float(ckpt.get("best_miou", ckpt.get("mean_iou", 0.0)))
+    if world_rank == 0:
+        print(f"Resumed from epoch {start_epoch}, best mIoU {best_miou:.4f}")
     return start_epoch, best_miou
 
 
@@ -386,21 +393,18 @@ def train_func(config):
 
     criterion = nn.CrossEntropyLoss()
 
-    best_miou = 0
+    # Base LR per param group, taken from the config before any checkpoint
+    # is loaded, so the schedule is identical on every rank and on resume.
+    base_lrs = [pg["lr"] for pg in optimizer.param_groups]
+
+    best_miou = 0.0
     start_epoch = 0
 
-    if config.get("resume_checkpoint") and world_rank == 0:
+    # Every rank loads the checkpoint (shared filesystem), so all replicas
+    # resume with the same weights and optimizer state.
+    if config.get("resume_checkpoint"):
         start_epoch, best_miou = load_checkpoint(
-            config["resume_checkpoint"], model, optimizer, device)
-
-    if world_size > 1:
-        import torch.distributed as dist
-        se = torch.tensor(start_epoch, device=device)
-        bm = torch.tensor(best_miou, device=device)
-        dist.broadcast(se, src=0)
-        dist.broadcast(bm, src=0)
-        start_epoch = int(se.item())
-        best_miou = bm.item()
+            config["resume_checkpoint"], model, optimizer, device, world_rank)
 
     for epoch in range(start_epoch, config["epochs"]):
         model.train()
@@ -413,12 +417,8 @@ def train_func(config):
             progress = (epoch - warmup) / max(1, config["epochs"] - warmup)
             lr_scale = 0.5 * (1 + math.cos(math.pi * progress))
 
-        for pg in optimizer.param_groups:
-            pg["lr"] = pg["initial_lr"] * lr_scale if "initial_lr" in pg else pg["lr"]
-        # Store initial LR on first epoch
-        if epoch == 0:
-            for pg in optimizer.param_groups:
-                pg["initial_lr"] = pg["lr"]
+        for pg, base_lr in zip(optimizer.param_groups, base_lrs):
+            pg["lr"] = base_lr * lr_scale
 
         epoch_loss = 0
         num_batches = 0
@@ -456,11 +456,13 @@ def train_func(config):
                       f"loss={loss.item():.4f} "
                       f"{num_batches * config['batch_size'] * world_size / elapsed:.0f} img/s")
 
-        train_loss = epoch_loss / max(num_batches, 1)
+        # Global totals, not rank 0's share of the data
+        g_loss, g_batches = global_sum([epoch_loss, num_batches], device)
+        train_loss = g_loss / max(g_batches, 1)
 
         # Save latest
         if config.get("save_models"):
-            save_checkpoint(model, optimizer, epoch, best_miou,
+            save_checkpoint(model, optimizer, epoch, best_miou, best_miou,
                             config, is_best=False, world_rank=world_rank)
 
         # Validation
@@ -483,20 +485,17 @@ def train_func(config):
                                                mode="bilinear", align_corners=False)
                     val_ious.append(compute_iou(logits, masks))
 
-            val_miou = np.mean(val_ious) if val_ious else 0.0
-
-            if world_size > 1:
-                import torch.distributed as dist
-                vm = torch.tensor(val_miou, device=device)
-                dist.all_reduce(vm, op=dist.ReduceOp.AVG)
-                val_miou = vm.item()
+            # Mean over all validation batches on all ranks
+            iou_sum, iou_count = global_sum(
+                [sum(val_ious), len(val_ious)], device)
+            val_miou = iou_sum / iou_count if iou_count > 0 else 0.0
 
             is_best = val_miou > best_miou
             if is_best:
                 best_miou = val_miou
 
             if config.get("save_models") and is_best:
-                save_checkpoint(model, optimizer, epoch, val_miou,
+                save_checkpoint(model, optimizer, epoch, val_miou, best_miou,
                                 config, is_best=True, world_rank=world_rank)
 
         ray.train.report({

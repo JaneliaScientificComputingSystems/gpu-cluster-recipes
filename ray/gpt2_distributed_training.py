@@ -24,10 +24,12 @@ from ray.train import ScalingConfig, RunConfig
 from ray.train.torch import TorchTrainer
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
-from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+from torch.distributed.fsdp import (
+    FullStateDictConfig, FullOptimStateDictConfig, StateDictType)
 
 from gpt2_model import GPT2, Block, GPT2_CONFIGS
 from train_logging import make_log_path, MetricLogger
+from train_utils import global_sum
 
 
 def parse_args():
@@ -72,7 +74,7 @@ def get_lr(it, warmup_iters, max_iters, lr, min_lr=6e-5):
 # Checkpoint
 # ---------------------------------------------------------------------------
 
-def save_checkpoint(model, optimizer, iter_num, val_loss, config,
+def save_checkpoint(model, optimizer, iter_num, val_loss, best_val, config,
                     is_best=False, world_rank=0):
     model_dir = config["model_dir"]
     mode = config.get("mode", "ddp")
@@ -82,9 +84,15 @@ def save_checkpoint(model, optimizer, iter_num, val_loss, config,
 
     if mode == "fsdp":
         # FSDP: gather full state dict on rank 0, all ranks must participate
+        # The optimizer state is sharded too, so it is gathered the same way;
+        # optimizer.state_dict() would only hold rank 0's shard.
         cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, cfg):
+        optim_cfg = FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT,
+                                  cfg, optim_cfg):
             state_dict = model.state_dict()
+            optim_state = FSDP.optim_state_dict(model, optimizer)
+        optim_format = "fsdp_full"
         if world_rank != 0:
             return
     else:
@@ -92,27 +100,57 @@ def save_checkpoint(model, optimizer, iter_num, val_loss, config,
             return
         raw = model.module if hasattr(model, "module") else model
         state_dict = raw.state_dict()
+        optim_state = optimizer.state_dict()
+        optim_format = "plain"
 
     os.makedirs(model_dir, exist_ok=True)
     torch.save({
         "iter_num":            iter_num,
         "model_state_dict":    state_dict,
-        "optimizer_state_dict": optimizer.state_dict(),
+        "optimizer_state_dict": optim_state,
+        "optimizer_format":    optim_format,
         "val_loss":            val_loss,
+        "best_val":            best_val,
     }, path)
     print(f"Checkpoint: {path}  (val_loss {val_loss:.4f})")
 
 
-def load_checkpoint(path, model, optimizer, device):
+def load_checkpoint(path, model, optimizer, device, mode="ddp", world_rank=0):
+    """Restore model and optimizer. Called on every rank in both modes: DDP
+    syncs weights only when it is constructed, and FSDP reshards the full
+    state dict on each rank."""
     if not os.path.exists(path):
         raise FileNotFoundError(f"Checkpoint not found: {path}")
-    ckpt = torch.load(path, map_location=device)
-    raw = model.module if hasattr(model, "module") else model
-    raw.load_state_dict(ckpt["model_state_dict"])
-    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+    # Older checkpoints have no format tag; their optimizer state is a plain
+    # optimizer.state_dict() (under FSDP, rank 0's shard only).
+    optim_format = None
+    if mode == "fsdp":
+        ckpt = torch.load(path, map_location="cpu")
+        optim_format = ckpt.get("optimizer_format")
+        # Load through the FSDP wrapper so its hooks reshard the full state
+        # dict; loading into model.module bypasses them.
+        model.load_state_dict(ckpt["model_state_dict"])
+        optim_ok = optim_format == "fsdp_full"
+        if optim_ok:
+            optimizer.load_state_dict(FSDP.optim_state_dict_to_load(
+                model=model, optim=optimizer,
+                optim_state_dict=ckpt["optimizer_state_dict"]))
+    else:
+        ckpt = torch.load(path, map_location=device)
+        optim_format = ckpt.get("optimizer_format")
+        raw = model.module if hasattr(model, "module") else model
+        raw.load_state_dict(ckpt["model_state_dict"])
+        optim_ok = optim_format != "fsdp_full"
+        if optim_ok:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
     start_iter  = ckpt["iter_num"] + 1
-    best_val    = ckpt.get("val_loss", float("inf"))
-    print(f"Resumed from iter {start_iter}, best val_loss {best_val:.4f}")
+    # Older checkpoints only have the val loss of the iter they were saved at.
+    best_val    = float(ckpt.get("best_val", ckpt.get("val_loss", float("inf"))))
+    if world_rank == 0:
+        print(f"Resumed from iter {start_iter}, best val_loss {best_val:.4f}")
+        if not optim_ok:
+            print("WARNING: optimizer state in this checkpoint does not match "
+                  f"--mode={mode}; optimizer restarts from scratch")
     return start_iter, best_val
 
 
@@ -121,8 +159,6 @@ def load_checkpoint(path, model, optimizer, device):
 # ---------------------------------------------------------------------------
 
 def train_func(config):
-    import torch.distributed as dist
-
     world_rank = ray.train.get_context().get_world_rank()
     world_size = ray.train.get_context().get_world_size()
     logger = MetricLogger(config.get("log_path"), world_rank)
@@ -130,6 +166,8 @@ def train_func(config):
     # 1. Create model on CPU, prepare_model handles device + DDP + NCCL
     model_cfg = GPT2_CONFIGS[config["model_size"]]
     model = GPT2(model_cfg)
+    # Count before wrapping: under FSDP model.parameters() is one rank's shard
+    n_params = sum(p.numel() for p in model.parameters())
 
     if config["mode"] == "fsdp":
         device = ray.train.torch.get_device()
@@ -153,7 +191,7 @@ def train_func(config):
         backend = "InfiniBand (GPUDirect RDMA)" if nccl_ib == "0" else "Ethernet"
         print(f"Workers: {world_size} | GPU: {torch.cuda.get_device_name(device)}")
         print(f"Mode: {config['mode'].upper()} | Network: {backend} | dtype: {dtype}")
-        print(f"GPT-2 parameters: {sum(p.numel() for p in model.parameters())/1e6:.1f}M")
+        print(f"GPT-2 parameters: {n_params/1e6:.1f}M")
         print(f"Effective batch: {config['batch_size'] * config['grad_accum'] * world_size}"
               f" seqs ({config['batch_size'] * config['grad_accum'] * world_size * config['seq_len']:,} tokens)")
 
@@ -169,22 +207,12 @@ def train_func(config):
     best_val   = float("inf")
     start_iter = 0
 
+    # Every rank loads the checkpoint (shared filesystem), so all replicas
+    # resume with the same weights and optimizer state.
     if config.get("resume_checkpoint"):
-        if config["mode"] == "fsdp":
-            # FSDP: all ranks load the full state dict, then reshard
-            start_iter, best_val = load_checkpoint(
-                config["resume_checkpoint"], model, optimizer, device)
-        elif world_rank == 0:
-            start_iter, best_val = load_checkpoint(
-                config["resume_checkpoint"], model, optimizer, device)
-
-    if world_size > 1 and config["mode"] != "fsdp":
-        si = torch.tensor(start_iter, device=device)
-        bv = torch.tensor(best_val,   device=device)
-        dist.broadcast(si, src=0)
-        dist.broadcast(bv, src=0)
-        start_iter = int(si.item())
-        best_val   = bv.item()
+        start_iter, best_val = load_checkpoint(
+            config["resume_checkpoint"], model, optimizer, device,
+            config["mode"], world_rank)
 
     t0         = time.time()
     tokens_total = 0
@@ -215,9 +243,11 @@ def train_func(config):
                 ))
                 batch = next(train_iter)
 
-            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            input_ids = batch["input_ids"][:, :config["seq_len"]].to(
+                device, non_blocking=True)
             x = input_ids[:, :-1]
             y = input_ids[:, 1:]
+            tokens_total += x.numel() * world_size
 
             sync = (micro == config["grad_accum"] - 1)
             ctx_sync = model.no_sync() if not sync and hasattr(model, "no_sync") \
@@ -230,11 +260,13 @@ def train_func(config):
                 scaler.scale(loss).backward()
                 accum_loss += loss.item()
 
-        tokens_total += (config["batch_size"] * config["grad_accum"]
-                         * (config["seq_len"] - 1) * world_size)
-
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        if config["mode"] == "fsdp":
+            # Global norm across all shards; the torch.nn.utils version would
+            # clip each rank by the norm of its own shard.
+            model.clip_grad_norm_(1.0)
+        else:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         scaler.step(optimizer)
         scaler.update()
 
@@ -245,8 +277,10 @@ def train_func(config):
                        f"lr {lr:.2e} | {tok_sec/1e3:.1f}K tok/s | "
                        f"{dt:.0f}s elapsed")
 
-        # Eval
-        if it % config["eval_interval"] == 0 and it > 0:
+        # Eval — every eval_interval iters and always on the last iter, so
+        # short runs still report metrics and the final checkpoint is evaluated
+        is_last = (it == config["max_iters"] - 1)
+        if (it % config["eval_interval"] == 0 and it > 0) or is_last:
             model.eval()
             val_losses = []
             val_iter = iter(val_shard.iter_torch_batches(
@@ -257,29 +291,32 @@ def train_func(config):
                         vbatch = next(val_iter)
                     except StopIteration:
                         break
-                    input_ids = vbatch["input_ids"].to(device, non_blocking=True)
+                    input_ids = vbatch["input_ids"][:, :config["seq_len"]].to(
+                        device, non_blocking=True)
                     vx = input_ids[:, :-1]
                     vy = input_ids[:, 1:]
                     with ctx:
                         _, vloss = model(vx, vy)
                     val_losses.append(vloss.item())
-            val_loss = float(np.mean(val_losses)) if val_losses else float("inf")
-            if world_size > 1:
-                vl = torch.tensor(val_loss, device=device)
-                dist.all_reduce(vl, op=dist.ReduceOp.AVG)
-                val_loss = vl.item()
+            # Mean over all validation batches on all ranks
+            v_sum, v_count = global_sum(
+                [sum(val_losses), len(val_losses)], device)
+            val_loss = v_sum / v_count if v_count > 0 else float("inf")
             model.train()
 
             if world_rank == 0:
                 tok_sec = tokens_total / (time.time() - t0)
                 logger.log(f"  val_loss {val_loss:.4f} | {tok_sec/1e3:.1f}K tok/s")
 
+            is_best = val_loss < best_val
+            if is_best:
+                best_val = val_loss
+
             if config.get("save_models"):
-                save_checkpoint(model, optimizer, it, val_loss,
+                save_checkpoint(model, optimizer, it, val_loss, best_val,
                                 config, is_best=False, world_rank=world_rank)
-                if val_loss < best_val:
-                    best_val = val_loss
-                    save_checkpoint(model, optimizer, it, val_loss,
+                if is_best:
+                    save_checkpoint(model, optimizer, it, val_loss, best_val,
                                     config, is_best=True, world_rank=world_rank)
 
             ray.train.report({
@@ -287,10 +324,6 @@ def train_func(config):
                 "tok_sec": tokens_total / (time.time() - t0),
                 "best_val": best_val,
             })
-
-    if config.get("save_models"):
-        save_checkpoint(model, optimizer, config["max_iters"],
-                        best_val, config, is_best=False, world_rank=world_rank)
 
     if world_rank == 0:
         elapsed = time.time() - t0
@@ -329,7 +362,9 @@ def main():
         return
     print(f"Found {len(train_files)} train shards, {len(val_files)} val shards")
 
-    train_ds = ray.data.read_parquet(train_files)
+    # Randomise shard order on each pass so a resumed or repeated pass does
+    # not replay the stream in the same order
+    train_ds = ray.data.read_parquet(train_files).randomize_block_order()
     val_ds = ray.data.read_parquet(val_files)
 
     print(f"Max iters: {args.max_iters} | "
