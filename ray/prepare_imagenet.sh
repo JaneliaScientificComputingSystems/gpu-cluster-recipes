@@ -49,6 +49,13 @@ echo "Data dir: $DATA_DIR"
 echo "Size:     ~138 GB"
 echo "================================================================"
 
+# LSF does not create the log directory; without it the job output is lost
+mkdir -p ../output
+
+# HF_TOKEN is NOT written into the job script (LSF stores it and shows it in
+# bjobs -l); bsub forwards the submission environment to the job instead.
+export HF_TOKEN
+
 cat << EOF | bsub
 #!/bin/bash
 #BSUB -J imagenet_download
@@ -58,7 +65,10 @@ cat << EOF | bsub
 #BSUB -W 24:00
 
 source ${VENV_PATH}/bin/activate
-export HF_TOKEN="${HF_TOKEN}"
+if [ -z "\$HF_TOKEN" ]; then
+    echo "ERROR: HF_TOKEN did not reach the job environment"
+    exit 1
+fi
 
 mkdir -p ${DATA_DIR}
 
@@ -90,38 +100,10 @@ for f in sorted(os.listdir(data_dir)):
         size = os.path.getsize(path) / 1e9
         print(f"  {f}: {size:.1f} GB")
 PYEOF
-
-echo ""
-echo "ImageNet download complete. Building Arrow cache..."
-
-python3 - << 'PYEOF2'
-import os
-
-data_dir = "${DATA_DIR}"
-hf_cache = os.path.join(data_dir, "hf_cache")
-os.environ["HF_DATASETS_CACHE"] = hf_cache
-os.environ["HF_HOME"] = hf_cache
-
-from datasets import load_dataset
-
-parquet_dir = os.path.join(data_dir, "data")
-if not os.path.isdir(parquet_dir):
-    parquet_dir = data_dir
-
-print("Loading parquet shards into Arrow cache (single process, ~6 min)...")
-dataset = load_dataset(
-    "parquet",
-    data_files={
-        "train": os.path.join(parquet_dir, "train-*.parquet"),
-        "validation": os.path.join(parquet_dir, "validation-*.parquet"),
-    },
-    cache_dir=hf_cache,
-)
-print(f"  Train: {len(dataset['train']):,} images")
-print(f"  Val:   {len(dataset['validation']):,} images")
-print(f"  Cache: {hf_cache}")
-print("Arrow cache built. Training runs will reuse it instantly.")
-PYEOF2
+if [ \$? -ne 0 ]; then
+    echo "ERROR: ImageNet download failed"
+    exit 1
+fi
 
 echo ""
 echo "ImageNet preparation complete."

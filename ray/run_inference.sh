@@ -4,7 +4,7 @@
 #
 # Usage:
 #   ./run_inference.sh --script=image_classifier.py -- --model ../models/cifar10_resnet18_best.pth --test
-#   ./run_inference.sh --script=gpt2_generate.py -- --model ../models/gpt2_small_ddp_best.pth --interactive
+#   ./run_inference.sh --script=gpt2_generate.py -- --model ../models/gpt2_small_ddp_best.pth --prompt "The brain"
 #   ./run_inference.sh --script=gpt2_eval.py -- --model ../models/gpt2_small_ddp_best.pth --num-batches 200
 #   ./run_inference.sh --script=imagenet_classifier.py -- --model ../models/resnet50_imagenet_best.pth --test
 #
@@ -12,6 +12,11 @@
 #   --queue=QUEUE    GPU queue (default: gpu_l4)
 #   --venv=PATH      Python venv path
 #   --script=FILE    Inference script to run
+#
+# The job runs in this script's directory (ray/), so relative paths in the
+# script arguments (--model, --image, ...) are resolved against ray/, and logs
+# go to ray/../output. Batch jobs have no terminal: for gpt2_generate.py
+# --interactive use an interactive job (bsub -Is) instead — see README.md.
 #===============================================================================
 
 QUEUE_NAME="gpu_l4"
@@ -39,6 +44,11 @@ if [ ! -f "$PYTHON_SCRIPT" ]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# The job cds to SCRIPT_DIR, so pin the script path checked above
+PYTHON_SCRIPT="$(cd "$(dirname "$PYTHON_SCRIPT")" && pwd)/$(basename "$PYTHON_SCRIPT")"
+OUTPUT_DIR="${SCRIPT_DIR}/../output"
+# LSF does not create the log directory; without it the job output is lost
+mkdir -p "$OUTPUT_DIR"
 SCRIPT_NAME=$(basename "$PYTHON_SCRIPT" .py)
 
 # Set app profile based on queue
@@ -64,8 +74,8 @@ cat << EOF | bsub
 #BSUB -q ${QUEUE_NAME}
 ${APP_LINE}
 #BSUB -gpu "num=1:mode=exclusive_process"
-#BSUB -o ../output/${SCRIPT_NAME}_%J.out
-#BSUB -e ../output/${SCRIPT_NAME}_%J.err
+#BSUB -o ${OUTPUT_DIR}/${SCRIPT_NAME}_%J.out
+#BSUB -e ${OUTPUT_DIR}/${SCRIPT_NAME}_%J.err
 #BSUB -W 1:00
 
 if [ -n "${VENV_PATH}" ]; then source ${VENV_PATH}/bin/activate; fi

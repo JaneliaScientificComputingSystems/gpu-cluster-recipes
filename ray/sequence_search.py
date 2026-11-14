@@ -57,9 +57,10 @@ def parse_fasta_from_bytes(data, start_offset):
     """Parse FASTA from a byte chunk, handling boundary alignment."""
     text = data.decode("utf-8", errors="replace")
 
-    # If we're not at the start of the file, skip to the first '>' to avoid
-    # partial sequences
-    if start_offset > 0:
+    # If the chunk starts mid-record, skip to the first '>' to avoid partial
+    # sequences. Chunks from find_chunk_boundaries() already start on a '>',
+    # and their first record must be kept.
+    if start_offset > 0 and not text.startswith(">"):
         idx = text.find("\n>")
         if idx == -1:
             return []
@@ -144,8 +145,10 @@ def search_chunk(db_path, start, end, query_kmers_list, query_headers, k, top_n)
             score = jaccard(query_kmer_sets[qi], db_kmers)
             if score > 0:
                 hits = top_hits[qi]
+                # hits is kept sorted (best first) so hits[-1] is the minimum
                 if len(hits) < top_n:
                     hits.append((score, db_header, len(db_seq)))
+                    hits.sort(key=lambda x: -x[0])
                 elif score > hits[-1][0]:
                     hits[-1] = (score, db_header, len(db_seq))
                     hits.sort(key=lambda x: -x[0])

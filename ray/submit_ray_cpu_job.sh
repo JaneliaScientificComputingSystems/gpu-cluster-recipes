@@ -14,7 +14,7 @@
 #   ./submit_ray_cpu_job.sh --num-cpus=300 --script=distributed_etl.py -- --input /data
 #
 #   # Quick test on short queue (1 hour max):
-#   ./submit_ray_cpu_job.sh --queue=short --num-cpus=4 --script=test.py
+#   ./submit_ray_cpu_job.sh --queue=short --walltime=1:00 --num-cpus=4 --script=test.py
 #
 # Queue:
 #   cpu_parallel -> multi-node, app profile parallel-128   [default]
@@ -30,7 +30,7 @@ usage() {
     echo "Optional:"
     echo "  --queue=QUEUE        LSF queue (default: cpu_parallel)"
     echo "  --job-name=NAME      Job name (default: ray_cpu_job)"
-    echo "  --walltime=TIME      Walltime HH:MM (default: 24:00 local, 1:00 short)"
+    echo "  --walltime=TIME      Walltime HH:MM (default: 24:00)"
     echo "  --venv=PATH          Python venv path"
     echo ""
     echo "Script arguments: use '--' separator"
@@ -77,6 +77,9 @@ echo "Total CPUs:      $TOTAL_CPUS"
 echo "Walltime:        $WALLTIME"
 echo "================================================================"
 
+# LSF does not create the log directory; without it the job output is lost
+mkdir -p ../output
+
 cat << EOF | bsub
 #!/bin/bash
 #BSUB -J ${JOB_NAME}
@@ -89,7 +92,8 @@ cat << EOF | bsub
 
 if [ -n "${VENV_PATH}" ]; then source ${VENV_PATH}/bin/activate; fi
 
-export RAY_TMPDIR="/scratch/\$(whoami)/ray_\$(whoami)"
+# Per-job temp dir so concurrent/back-to-back jobs never share Ray session state
+export RAY_TMPDIR="/scratch/\$(whoami)/ray_\$(whoami)_\${LSB_JOBID}"
 mkdir -p \$RAY_TMPDIR
 
 function getfreeport() {
@@ -115,9 +119,27 @@ for host in "\${hosts[@]}"; do
 done
 
 for host in "\${hosts[@]}"; do
-    blaunch -z \$host "mkdir -p /scratch/\$(whoami)/ray_\$(whoami)" &
+    blaunch -z \$host "mkdir -p \$RAY_TMPDIR" &
 done
 wait
+
+# Stop Ray and remove the per-job temp dir on every host. Runs on normal exit,
+# on startup failure, and when LSF signals the job (bkill / walltime).
+cleanup_done=0
+function cleanup() {
+    [ \$cleanup_done -eq 1 ] && return
+    cleanup_done=1
+    for host in "\${hosts[@]}"; do
+        blaunch -z \$host "if [ -n '${VENV_PATH}' ]; then source ${VENV_PATH}/bin/activate; fi; ray stop >/dev/null 2>&1; rm -rf \$RAY_TMPDIR" &
+    done
+    wait
+    echo "Ray cluster stopped"
+}
+trap cleanup EXIT
+trap 'echo "Job interrupted by signal — cleaning up"; exit 143' INT TERM USR2
+
+# Seconds to wait for the head / each worker / the full node count
+RAY_START_TIMEOUT=300
 
 port=\$(getfreeport)
 head_node=\${hosts[0]}
@@ -134,17 +156,34 @@ blaunch -z \$head_node "
     ray start --head --port \$port \
         --num-cpus=\${host_cpus[\$head_node]} \
         --num-gpus=0 \
-        --temp-dir=/scratch/\$(whoami)/ray_\$(whoami) \
+        --temp-dir=\$RAY_TMPDIR \
         --dashboard-agent-grpc-port=20100 \
         --dashboard-agent-listen-port=20101
 " &
 
 sleep 20
+waited=20
 while ! ray status --address \$head_node:\$port 2>/dev/null; do
+    if [ \$waited -ge \$RAY_START_TIMEOUT ]; then
+        echo "ERROR: Ray head node on \$head_node did not start within \${RAY_START_TIMEOUT}s"
+        echo "       Check --venv (${VENV_PATH}) and the 'ray start' errors above."
+        exit 1
+    fi
     echo "Waiting for Ray head node..."
     sleep 3
+    waited=\$((waited + 3))
 done
 echo "Ray head node ready"
+
+# Number of live nodes the head reports ("Active:" section of ray status).
+# Prints 0 if the output cannot be parsed.
+function ray_node_count() {
+    ray status --address \$head_node:\$port 2>/dev/null | awk '
+        /^(Active|Healthy):/ { in_active = 1; next }
+        /^[A-Za-z]/          { in_active = 0 }
+        in_active && \$1 ~ /^[0-9]+\$/ { n += \$1 }
+        END { print n + 0 }'
+}
 
 if [ \$num_nodes -gt 1 ]; then
     workers=("\${hosts[@]:1}")
@@ -154,17 +193,44 @@ if [ \$num_nodes -gt 1 ]; then
             ray start --address \$head_node:\$port \
                 --num-cpus=\${host_cpus[\$host]} \
                 --num-gpus=0 \
-                --temp-dir=/scratch/\$(whoami)/ray_\$(whoami) \
+                --temp-dir=\$RAY_TMPDIR \
                 --dashboard-agent-grpc-port=20100 \
                 --dashboard-agent-listen-port=20101
         " &
         sleep 10
+        waited=10
         while ! blaunch -z \$host ray status --address \$head_node:\$port 2>/dev/null; do
+            if [ \$waited -ge \$RAY_START_TIMEOUT ]; then
+                echo "ERROR: worker \$host could not reach the Ray head within \${RAY_START_TIMEOUT}s"
+                exit 1
+            fi
             echo "Waiting for worker \$host..."
             sleep 3
+            waited=\$((waited + 3))
         done
-        echo "Worker \$host connected"
+        echo "Worker \$host started"
     done
+
+    # The check above only proves the head is reachable from each worker.
+    # Confirm that every node actually joined before starting the script.
+    waited=0
+    nodes_up=\$(ray_node_count)
+    while [ "\$nodes_up" -gt 0 ] && [ "\$nodes_up" -lt \$num_nodes ]; do
+        if [ \$waited -ge \$RAY_START_TIMEOUT ]; then
+            echo "ERROR: only \$nodes_up of \$num_nodes nodes joined the Ray cluster within \${RAY_START_TIMEOUT}s"
+            ray status --address \$head_node:\$port
+            exit 1
+        fi
+        echo "Waiting for nodes to join: \$nodes_up/\$num_nodes"
+        sleep 3
+        waited=\$((waited + 3))
+        nodes_up=\$(ray_node_count)
+    done
+    if [ "\$nodes_up" -eq 0 ]; then
+        echo "WARNING: could not read the node count from 'ray status' — not verified"
+    else
+        echo "All \$nodes_up nodes joined"
+    fi
 fi
 
 echo ""
@@ -178,11 +244,7 @@ RAY_ADDRESS=\$head_node:\$port python ${PYTHON_SCRIPT} ${SCRIPT_ARGS}
 script_exit_code=\$?
 echo "Script exited: \$script_exit_code"
 
-for host in "\${hosts[@]}"; do
-    blaunch -z \$host "if [ -n '${VENV_PATH}' ]; then source ${VENV_PATH}/bin/activate; fi; ray stop" &
-done
-wait
-echo "Ray cluster stopped"
+cleanup
 
 if [ \$script_exit_code -ne 0 ]; then
     echo "================================================================"

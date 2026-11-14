@@ -27,19 +27,20 @@ echo "================================================================"
 echo "Target: $DATA_DIR"
 echo ""
 
-mkdir -p "$DATA_DIR"
-cd "$DATA_DIR"
+mkdir -p "$DATA_DIR" || { echo "ERROR: cannot create $DATA_DIR (use --data-dir=PATH)"; exit 1; }
+cd "$DATA_DIR" || { echo "ERROR: cannot enter $DATA_DIR"; exit 1; }
 
-BASE_URL="http://livecell-dataset.s3.eu-central-1.amazonaws.com/LIVECell_dataset_2021"
+BASE_URL="https://livecell-dataset.s3.eu-central-1.amazonaws.com/LIVECell_dataset_2021"
 
 # Download images
 if [ -d "images/livecell_train_val_images" ]; then
     echo "Images already present — skipping download"
 else
     echo "Downloading images (1.3 GB)..."
-    wget -q --show-progress "$BASE_URL/images.zip" -O images.zip
+    wget -q --show-progress "$BASE_URL/images.zip" -O images.zip || {
+        echo "ERROR: download of images.zip failed"; rm -f images.zip; exit 1; }
     echo "Extracting..."
-    unzip -q images.zip
+    unzip -q images.zip || { echo "ERROR: extracting images.zip failed"; exit 1; }
     rm images.zip
     echo "Images extracted"
 fi
@@ -52,7 +53,10 @@ for split in train val test; do
         echo "Annotation $FILE already present — skipping"
     else
         echo "Downloading $FILE..."
-        wget -q --show-progress "$ANN_URL/$FILE" -O "$FILE"
+        # Download to a temp name so a failed download is never mistaken
+        # for a complete file on the next run
+        wget -q --show-progress "$ANN_URL/$FILE" -O "$FILE.part" && mv "$FILE.part" "$FILE" || {
+            echo "ERROR: download of $FILE failed"; rm -f "$FILE.part"; exit 1; }
     fi
 done
 

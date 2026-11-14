@@ -12,6 +12,7 @@ import argparse
 import glob
 import io
 import os
+import pickle
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -23,14 +24,28 @@ from livecell_finetune import SwinSegModel
 
 
 def load_model(path, device):
-    ckpt = torch.load(path, map_location=device, weights_only=False)
+    try:
+        ckpt = torch.load(path, map_location=device, weights_only=True)
+    except pickle.UnpicklingError as e:
+        raise SystemExit(
+            f"ERROR: cannot load {path} with weights_only=True:\n  {e}\n"
+            "Checkpoints written by older versions of livecell_finetune.py "
+            "(single-GPU runs) store 'mean_iou' as a numpy scalar, which the "
+            "safe loader rejects.\nRe-train, or — only if you trust the file — "
+            "re-save it once with:\n"
+            "  python -c \"import torch; p='" + path + "'; "
+            "c=torch.load(p, map_location='cpu', weights_only=False); "
+            "c['mean_iou']=float(c['mean_iou']); torch.save(c, p)\"")
     model = SwinSegModel(pretrained=False, num_classes=3)
     model.load_state_dict(ckpt["model_state_dict"])
     model.to(device).eval()
     epoch = ckpt.get("epoch", "?")
     miou = ckpt.get("mean_iou", "?")
     print(f"Loaded: {path}")
-    print(f"  Epoch: {epoch}  |  mIoU: {miou}")
+    if "best_miou" in ckpt:
+        print(f"  Epoch: {epoch}  |  mIoU: {miou}  |  Best mIoU: {ckpt['best_miou']}")
+    else:
+        print(f"  Epoch: {epoch}  |  mIoU: {miou}")
     return model
 
 
@@ -71,9 +86,9 @@ def segment_image(model, image, device, tile_size=512, overlap=64):
             pred[:, y1:y2, x1:x2] += logits
             count[:, y1:y2, x1:x2] += 1
 
-            if y2 >= h:
+            if x2 >= w:
                 break
-        if y + step >= h:
+        if y2 >= h:
             break
 
     pred = pred / count.clamp(min=1)

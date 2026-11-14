@@ -35,6 +35,9 @@ echo "Venv:     $VENV_PATH"
 echo "Data dir: $DATA_DIR"
 echo "================================================================"
 
+# LSF does not create the log directory; without it the job output is lost
+mkdir -p ../output
+
 cat << EOF | bsub
 #!/bin/bash
 #BSUB -J openwebtext_prep

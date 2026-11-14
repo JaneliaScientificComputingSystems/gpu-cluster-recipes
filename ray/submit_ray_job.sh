@@ -180,6 +180,9 @@ case $QUEUE_NAME in
     *)                          NCCL_ENV_FILE="$(cd "$(dirname "$0")" && pwd)/../nccl-ib/nccl_ib.sh" ;;
 esac
 
+# LSF does not create the log directory; without it the job output is lost
+mkdir -p ../output
+
 cat << EOF | bsub
 #!/bin/bash
 #BSUB -J ${JOB_NAME}_${NUM_NODES}nodes
@@ -202,11 +205,16 @@ export PYTHONUNBUFFERED=1
 # NCCL configuration — sourced from nccl_ib.sh for IB queues
 # All NCCL env vars live in one place to avoid duplication
 #-----------------------------------------------------------------------
+# GPU indices LSF assigned to this job (empty if LSF set none)
+LSF_CUDA_VISIBLE_DEVICES="\${CUDA_VISIBLE_DEVICES:-}"
+
 if [ "${NETWORK_BACKEND}" = "IB" ]; then
     echo "NCCL backend: InfiniBand"
-    source "${NCCL_ENV_FILE}"
+    NCCL_ENV_FILE="${NCCL_ENV_FILE}"
+    source "\$NCCL_ENV_FILE"
     echo "  HCAs: \$NCCL_IB_HCA"
 else
+    NCCL_ENV_FILE=""
     echo "NCCL backend: Ethernet"
     export NCCL_IB_DISABLE=1
     export NCCL_NET_GDR_LEVEL=0
@@ -215,6 +223,20 @@ else
     export NCCL_BUFFSIZE=8388608
     export NCCL_DEBUG=INFO
     export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+fi
+
+# Whole-node (parallel) queues use all GPUs 0-7. On non-parallel queues the
+# node is shared: keep the GPUs LSF assigned instead of the 0-7 set above.
+# GPU_ENV_FIX is re-applied in the ray start shells after they source the
+# NCCL env file.
+GPU_ENV_FIX=":"
+if [ "${PARALLEL_QUEUE}" != true ]; then
+    if [ -n "\$LSF_CUDA_VISIBLE_DEVICES" ]; then
+        GPU_ENV_FIX="export CUDA_VISIBLE_DEVICES=\$LSF_CUDA_VISIBLE_DEVICES"
+    else
+        GPU_ENV_FIX="unset CUDA_VISIBLE_DEVICES"
+    fi
+    \$GPU_ENV_FIX
 fi
 
 # Per-job temp dir so concurrent/back-to-back jobs never share Ray session state
@@ -239,9 +261,27 @@ echo "Host list: \${hosts[@]}"
 echo "Nodes: ${NUM_NODES} | GPUs: ${TOTAL_GPUS} | Network: ${NETWORK_BACKEND}"
 
 for host in "\${hosts[@]}"; do
-    blaunch -z \$host "mkdir -p /scratch/\$(whoami)/ray_\$(whoami)" &
+    blaunch -z \$host "mkdir -p \$RAY_TMPDIR" &
 done
 wait
+
+# Stop Ray and remove the per-job temp dir on every host. Runs on normal exit,
+# on startup failure, and when LSF signals the job (bkill / walltime).
+cleanup_done=0
+function cleanup() {
+    [ \$cleanup_done -eq 1 ] && return
+    cleanup_done=1
+    for host in "\${hosts[@]}"; do
+        blaunch -z \$host "if [ -n '${VENV_PATH}' ]; then source ${VENV_PATH}/bin/activate; fi; ray stop >/dev/null 2>&1; rm -rf \$RAY_TMPDIR" &
+    done
+    wait
+    echo "Ray cluster stopped"
+}
+trap cleanup EXIT
+trap 'echo "Job interrupted by signal — cleaning up"; exit 143' INT TERM USR2
+
+# Seconds to wait for the head / each worker / the full node count
+RAY_START_TIMEOUT=300
 
 # IB pre-flight check (IB queues only)
 if [ "${NETWORK_BACKEND}" = "IB" ]; then
@@ -251,7 +291,9 @@ if [ "${NETWORK_BACKEND}" = "IB" ]; then
         echo "ERROR: ibv_devinfo failed — IB drivers may not be loaded on this node"
         exit 1
     }
-    active_ports=\$(blaunch -z \${hosts[0]} "ibstat 2>/dev/null | grep -c 'State: Active'" 2>/dev/null || echo 0)
+    active_ports=\$(blaunch -z \${hosts[0]} "ibstat 2>/dev/null | grep -c 'State: Active'" 2>/dev/null)
+    # grep -c prints the count itself (also 0); anything else means ibstat failed
+    [[ "\$active_ports" =~ ^[0-9]+\$ ]] || active_ports=0
     echo "Active IB ports on head node: \$active_ports (expected 8)"
     if [ "\$active_ports" -lt 8 ]; then
         echo "WARNING: fewer than 8 IB ports active — some rails may be down"
@@ -265,9 +307,7 @@ echo "Head node: \$head_node  Port: \$port"
 
 # Path to NCCL env file — sourced by ray start shells so the daemon
 # (and all workers it spawns) inherit the vars.
-if [ "${NETWORK_BACKEND}" != "IB" ]; then
-    NCCL_ENV_FILE=""
-fi
+# (NCCL_ENV_FILE is set above; empty on Ethernet queues.)
 
 echo ""
 echo "================================================================"
@@ -278,6 +318,7 @@ blaunch -z \$head_node "
     if [ -n '${VENV_PATH}' ]; then source ${VENV_PATH}/bin/activate; fi
     export PYTHONUNBUFFERED=1
     if [ -n '\$NCCL_ENV_FILE' ] && [ -f '\$NCCL_ENV_FILE' ]; then source \$NCCL_ENV_FILE; fi
+    \$GPU_ENV_FIX
     ray stop --force >/dev/null 2>&1 || true   # clear any stale Ray daemon left on this node by a prior job
     ray start --head --port \$port \
         --num-cpus=${CPUS_PER_NODE} \
@@ -288,11 +329,28 @@ blaunch -z \$head_node "
 " &
 
 sleep 20
+waited=20
 while ! ray status --address \$head_node:\$port 2>/dev/null; do
+    if [ \$waited -ge \$RAY_START_TIMEOUT ]; then
+        echo "ERROR: Ray head node on \$head_node did not start within \${RAY_START_TIMEOUT}s"
+        echo "       Check --venv (${VENV_PATH}) and the 'ray start' errors above."
+        exit 1
+    fi
     echo "Waiting for Ray head node..."
     sleep 3
+    waited=\$((waited + 3))
 done
 echo "Ray head node ready"
+
+# Number of live nodes the head reports ("Active:" section of ray status).
+# Prints 0 if the output cannot be parsed.
+function ray_node_count() {
+    ray status --address \$head_node:\$port 2>/dev/null | awk '
+        /^(Active|Healthy):/ { in_active = 1; next }
+        /^[A-Za-z]/          { in_active = 0 }
+        in_active && \$1 ~ /^[0-9]+\$/ { n += \$1 }
+        END { print n + 0 }'
+}
 
 if [ ${NUM_NODES} -gt 1 ]; then
     workers=("\${hosts[@]:1}")
@@ -301,6 +359,7 @@ if [ ${NUM_NODES} -gt 1 ]; then
             if [ -n '${VENV_PATH}' ]; then source ${VENV_PATH}/bin/activate; fi
             export PYTHONUNBUFFERED=1
             if [ -n '\$NCCL_ENV_FILE' ] && [ -f '\$NCCL_ENV_FILE' ]; then source \$NCCL_ENV_FILE; fi
+            \$GPU_ENV_FIX
             ray stop --force >/dev/null 2>&1 || true   # clear any stale Ray daemon left on this node by a prior job
             ray start --address \$head_node:\$port \
                 --num-cpus=${CPUS_PER_NODE} \
@@ -310,12 +369,39 @@ if [ ${NUM_NODES} -gt 1 ]; then
                 --dashboard-agent-listen-port=20101
         " &
         sleep 10
+        waited=10
         while ! blaunch -z \$host ray status --address \$head_node:\$port 2>/dev/null; do
+            if [ \$waited -ge \$RAY_START_TIMEOUT ]; then
+                echo "ERROR: worker \$host could not reach the Ray head within \${RAY_START_TIMEOUT}s"
+                exit 1
+            fi
             echo "Waiting for worker \$host..."
             sleep 3
+            waited=\$((waited + 3))
         done
-        echo "Worker \$host connected"
+        echo "Worker \$host started"
     done
+
+    # The check above only proves the head is reachable from each worker.
+    # Confirm that every node actually joined before starting the script.
+    waited=0
+    nodes_up=\$(ray_node_count)
+    while [ "\$nodes_up" -gt 0 ] && [ "\$nodes_up" -lt \${#hosts[@]} ]; do
+        if [ \$waited -ge \$RAY_START_TIMEOUT ]; then
+            echo "ERROR: only \$nodes_up of \${#hosts[@]} nodes joined the Ray cluster within \${RAY_START_TIMEOUT}s"
+            ray status --address \$head_node:\$port
+            exit 1
+        fi
+        echo "Waiting for nodes to join: \$nodes_up/\${#hosts[@]}"
+        sleep 3
+        waited=\$((waited + 3))
+        nodes_up=\$(ray_node_count)
+    done
+    if [ "\$nodes_up" -eq 0 ]; then
+        echo "WARNING: could not read the node count from 'ray status' — not verified"
+    else
+        echo "All \$nodes_up nodes joined"
+    fi
 fi
 
 echo ""
@@ -333,11 +419,7 @@ RAY_ADDRESS=\$head_node:\$port python ${PYTHON_SCRIPT} ${SCRIPT_ARGS}
 script_exit_code=\$?
 echo "Script exited: \$script_exit_code"
 
-for host in "\${hosts[@]}"; do
-    blaunch -z \$host "if [ -n '${VENV_PATH}' ]; then source ${VENV_PATH}/bin/activate; fi; ray stop" &
-done
-wait
-echo "Ray cluster stopped"
+cleanup
 
 if [ \$script_exit_code -ne 0 ]; then
     echo "================================================================"

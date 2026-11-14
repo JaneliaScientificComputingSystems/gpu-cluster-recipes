@@ -47,15 +47,18 @@ Six ready-to-run examples:
 
 ```bash
 git clone https://github.com/JaneliaScientificComputingSystems/gpu-cluster-recipes.git
-cd gpu-cluster-recipes
-chmod +x submit_ray_job.sh prepare_openwebtext.sh prepare_imagenet.sh
+cd gpu-cluster-recipes/ray      # run all commands below from this directory
+chmod +x *.sh
 
 python -m venv ~/ray_env
 source ~/ray_env/bin/activate
-pip install "ray[train]" torch torchvision torchaudio
+pip install "ray[train,data]" torch torchvision torchaudio
 
 # For GPT-2 and ImageNet examples
 pip install datasets tiktoken
+
+# For the cell segmentation example
+pip install scipy scikit-image pycocotools
 ```
 
 ---
@@ -179,6 +182,8 @@ wget https://www.cs.toronto.edu/~kriz/cifar-10-python.tar.gz
 tar -xzf cifar-10-python.tar.gz && rm cifar-10-python.tar.gz
 ```
 
+`cifar10_distributed_training.py` has no `--data-dir` option — the path is fixed in the script (`dataset_path` in `main()`), so edit it there to train from your copy. `image_classifier.py` accepts `--data-dir=/your/path/cifar10`.
+
 </details>
 
 ### Train
@@ -275,8 +280,9 @@ GPT-2 uses iteration count, not epochs. Each iteration processes `batch_size × 
     --num-gpus=16 --num-nodes=2 --mode=ddp \
     --max-iters=2000 --batch-size=8 --grad-accum=8 --save-models
 
-# Full run — 50K iters
+# Full run — 50K iters (~6h: needs --walltime, the default for 2 nodes is 4h)
 ./submit_ray_job.sh 2 --queue=gpu_h200_parallel --venv=~/ray_env \
+    --walltime=8:00 \
     --script=gpt2_distributed_training.py -- \
     --num-gpus=16 --num-nodes=2 --mode=ddp \
     --max-iters=50000 --batch-size=8 --grad-accum=8 --save-models
@@ -321,6 +327,7 @@ Larger model sizes generate significantly more cross-node traffic. Use FSDP for 
     --model ../models/gpt2_small_ddp_best.pth --num-batches 200
 
 # For larger models, specify --model-size to match the checkpoint
+# (the XL stress-test command above does not pass --save-models; add it to get this file)
 ./run_inference.sh --venv=~/ray_env --script=gpt2_eval.py -- \
     --model ../models/gpt2_xl_ddp_best.pth --model-size=xl --num-batches 200
 ```
@@ -337,7 +344,7 @@ Larger model sizes generate significantly more cross-node traffic. Use FSDP for 
 ```bash
 bsub -n8 -q gpu_l4 -gpu "num=1" -W 4:00 -Is /bin/bash
 # once on the GPU node:
-cd ~/Projects/gpu-cluster-recipes
+cd ~/Projects/gpu-cluster-recipes/ray
 source ~/ray_env/bin/activate
 python gpt2_generate.py --model ../models/gpt2_small_ddp_best.pth --interactive
 ```
@@ -469,7 +476,7 @@ Same ImageNet-1K dataset as the ResNet-50 example — pre-installed at `/nrs/ml_
     --script=vit_imagenet_distributed_training.py -- \
     --num-gpus=16 --num-nodes=2 --model-size=large --epochs=3 --batch-size=32 --save-models
 
-# ViT-Large, full 90 epochs
+# ViT-Large, full 90 epochs (the default walltime for 2 nodes is 4h — add --walltime=HH:MM sized to your run)
 ./submit_ray_job.sh 2 --queue=gpu_h200_parallel --venv=~/ray_env \
     --job-name=vit_large \
     --script=vit_imagenet_distributed_training.py -- \
@@ -585,7 +592,7 @@ The segmenter takes a microscopy image and produces a colored overlay with indiv
     --model ../models/swin_livecell_best.pth --image-dir ./my_images/
 ```
 
-Output segmented images are saved to `../output/segmentation/`.
+Output segmented images are saved to `../output/segmentation/`. `run_inference.sh` runs the job in the `ray/` directory, so relative paths (`--model`, `--image`, `--image-dir`) are resolved against `ray/`.
 
 ---
 
@@ -642,6 +649,7 @@ UniRef90 is pre-installed at `/misc/blast/db/uniref90/uniref90.fasta` (28 GB, 83
 | `--db` | `/misc/blast/db/uniref90/uniref90.fasta` | Database FASTA file |
 | `--kmer-size` | 3 | K-mer size for similarity (3 = 8,000 possible protein 3-mers) |
 | `--top-n` | 10 | Report top N hits per query |
+| `--num-queries` | 5 | Number of sample queries in `--test` mode |
 | `--chunk-mb` | 100 | Database chunk size in MB |
 
 ---
@@ -677,7 +685,7 @@ Checkpoints: `--save-models` saves `<model>_latest.pth` (every epoch) and `<mode
 
 ## Monitoring
 
-Job output goes to `../output/`:
+Job output goes to `../output/` (relative to the directory you submit from; the submit scripts create it). On startup failure, `bkill` or walltime the submit scripts stop Ray and remove the per-job temp dir `/scratch/$USER/ray_$USER_<JOBID>` on every node:
 
 ```bash
 bjobs                              # list jobs

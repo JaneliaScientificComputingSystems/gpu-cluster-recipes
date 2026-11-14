@@ -62,8 +62,20 @@ def process_image(args):
         return fname, "skip"
 
     mask = create_semantic_mask(anns, h, w)
-    np.save(out_path, mask)
+    # Write to a temp name and rename, so an interrupted run never leaves a
+    # truncated .npy that a later run would treat as already done.
+    tmp_path = os.path.join(mask_dir, f".{base}.{os.getpid()}.tmp.npy")
+    np.save(tmp_path, mask)
+    os.replace(tmp_path, out_path)
     return fname, "done"
+
+
+def num_workers():
+    """CPUs this process may use: the LSF slot count inside a job, else all."""
+    try:
+        return max(1, int(os.environ["LSB_DJOB_NUMPROC"]))
+    except (KeyError, ValueError):
+        return os.cpu_count() or 1
 
 
 def process_split(data_dir, split):
@@ -97,8 +109,9 @@ def process_split(data_dir, split):
     skipped = 0
     total = len(tasks)
 
-    print(f"  Processing {total} images ({os.cpu_count()} workers)...")
-    with ProcessPoolExecutor(max_workers=os.cpu_count()) as pool:
+    workers = num_workers()
+    print(f"  Processing {total} images ({workers} workers)...")
+    with ProcessPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(process_image, t): t for t in tasks}
         for future in as_completed(futures):
             fname, status = future.result()
@@ -127,7 +140,8 @@ def main():
         process_split(args.data_dir, split)
 
     total = sum(
-        len(os.listdir(os.path.join(args.data_dir, "masks", s)))
+        sum(1 for f in os.listdir(os.path.join(args.data_dir, "masks", s))
+            if not f.startswith("."))
         for s in ["train", "val", "test"]
         if os.path.isdir(os.path.join(args.data_dir, "masks", s))
     )

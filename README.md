@@ -51,4 +51,4 @@ See each directory's `README.md` (and, for vLLM, `vllm/VLLM_SERVING_GUIDE.md` +
 `vllm/KIMI_K3_VLLM_GUIDE.md`) for full details.
 
 > **Job logs:** vLLM scripts write to `output/` at the repo root (git-ignored); the ray/torchrun
-> submit scripts default to `../output` (override with `--output-dir`).
+> submit scripts default to `../output` (torchrun: override with `--output-dir`; ray: no override).

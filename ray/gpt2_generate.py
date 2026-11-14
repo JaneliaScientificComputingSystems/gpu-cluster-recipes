@@ -49,7 +49,9 @@ def generate(model, idx, max_new_tokens, temperature=0.8, top_k=200):
 
 def run_prompt(model, enc, prompt, args, device):
     ids = enc.encode(prompt, allowed_special={"<|endoftext|>"})
-    x = torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)
+    if not ids:
+        ids = [enc.eot_token]  # empty prompt: start from <|endoftext|>
+    x =torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)
     out = generate(model, x, args.max_tokens, args.temperature, args.top_k)
     text = enc.decode(out[0].tolist())
     print(f"\n{text}\n")

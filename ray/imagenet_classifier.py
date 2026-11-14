@@ -37,12 +37,24 @@ def load_model(path, device):
     model = torchvision.models.resnet50(weights=None, num_classes=1000)
     model.load_state_dict(ckpt["model_state_dict"])
     model.to(device).eval()
-    top1 = ckpt.get("top1_accuracy", "?")
-    top5 = ckpt.get("top5_accuracy", "?")
     epoch = ckpt.get("epoch", "?")
     print(f"Loaded: {path}")
-    print(f"  Epoch: {epoch}  |  Top-1: {top1}%  |  Top-5: {top5}%")
+    print(f"  Epoch: {epoch}  |  {describe_accuracy(ckpt)}")
     return model
+
+
+def describe_accuracy(ckpt):
+    """Label the accuracy stored in a checkpoint. *_best.pth holds validation
+    top-1/top-5; *_latest.pth holds that epoch's TRAINING top-1 (top-5 = 0)."""
+    top1 = ckpt.get("top1_accuracy", "?")
+    top5 = ckpt.get("top5_accuracy", "?")
+    if top5 == 0:
+        text = f"Train top-1 (latest checkpoint): {top1}%"
+    else:
+        text = f"Val top-1: {top1}%  |  Val top-5: {top5}%"
+    if "best_top1" in ckpt:
+        text += f"  |  Best val top-1: {ckpt['best_top1']}%"
+    return text
 
 
 def predict(model, image, device, top_k=5):
