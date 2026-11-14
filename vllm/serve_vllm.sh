@@ -43,7 +43,16 @@
 #   --webui               also launch Open WebUI at the model and print its URL
 #   --webui-queue Q       CPU queue for the UI                [local]
 #   --webui-port N        UI port                             [8080]
+#   --webui-no-auth       launch the UI without a login (old behaviour; see serve_openwebui.sh)
 #   --domain D            domain suffix for routable URLs     [.int.janelia.org]
+#   --no-api-key          serve WITHOUT an API key (old open behaviour)
+#
+# API key (on by default): the server only answers /v1 requests that carry the key.
+#   It is $VLLM_API_KEY if you exported one before submitting, else a random key
+#   generated per job. Either way it reaches the server through the environment
+#   (never a command line) and is written, owner-only, to
+#       <repo>/output/<job-name>_<jobid>.apikey      (removed when the job ends)
+#   Use it with:  export VLLM_API_KEY=$(cat <that file>)
 #===============================================================================
 set -euo pipefail
 
@@ -56,6 +65,7 @@ PORT=8000; MAX_MODEL_LEN=32768; GPU_MEM_UTIL=0.90; WALLTIME="8:00"
 TOOL_PARSER=""; REASONING_PARSER=""
 HOST_PIN=""; EXIT_AFTER_TEST=false
 WEBUI=false; WEBUI_QUEUE="local"; WEBUI_PORT=8080; DOMAIN=".int.janelia.org"
+USE_API_KEY=true; WEBUI_NO_AUTH=false
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -84,7 +94,9 @@ while [[ $# -gt 0 ]]; do
     --webui-queue=*) WEBUI_QUEUE="${1#*=}"; shift ;;   --webui-queue) WEBUI_QUEUE="$2"; shift 2 ;;
     --webui-port=*) WEBUI_PORT="${1#*=}"; shift ;;     --webui-port) WEBUI_PORT="$2"; shift 2 ;;
     --domain=*) DOMAIN="${1#*=}"; shift ;;             --domain) DOMAIN="$2"; shift 2 ;;
-    -h|--help) sed -n '2,47p' "$0"; exit 0 ;;
+    --webui-no-auth) WEBUI_NO_AUTH=true; shift ;;
+    --no-api-key) USE_API_KEY=false; shift ;;
+    -h|--help) sed -n '2,56p' "$0"; exit 0 ;;
     *) echo "Unknown option: $1" >&2; exit 1 ;;
   esac
 done
@@ -139,7 +151,7 @@ fi
 FULL_NODE="${FULL_NODE:-false}"; ENABLE_AUTO_TOOL="${ENABLE_AUTO_TOOL:-false}"
 
 # CPU slots per GPU by queue — MUST match the node ratio or bsub stalls.
-case "$QUEUE" in *l4*) CPG=8 ;; *) CPG=12 ;; esac
+case "$QUEUE" in *rtx6000*) CPG=16 ;; *l4*) CPG=8 ;; *) CPG=12 ;; esac
 if [ "$FULL_NODE" = true ]; then GPUS=8; fi
 [ -n "$TP" ] || TP="$GPUS"
 [ -n "$CPUS" ] || CPUS=$((GPUS * CPG))
@@ -158,6 +170,15 @@ echo "  queue:   $QUEUE   gpus:$GPUS (tp=$TP) mode=$GPU_MODE cpus=$CPUS full_nod
 echo "  serve:   port=$PORT max-model-len=$MAX_MODEL_LEN gpu-mem-util=$GPU_MEM_UTIL walltime=$WALLTIME"
 [ "$ENABLE_AUTO_TOOL" = true ] && echo "  tools:   auto-tool-choice on, tool-parser=${TOOL_PARSER:-<none>}, reasoning-parser=${REASONING_PARSER:-<none>}"
 [ "$WEBUI" = true ] && echo "  webui:   yes (queue=$WEBUI_QUEUE port=$WEBUI_PORT)"
+if [ "$USE_API_KEY" != true ]; then
+    echo "  api key: NONE (--no-api-key) — anyone who can reach the node can use the model"
+    unset VLLM_API_KEY
+elif [ -n "${VLLM_API_KEY:-}" ]; then
+    echo "  api key: required — using \$VLLM_API_KEY from your environment"
+    export VLLM_API_KEY          # LSF carries the submission environment to the job
+else
+    echo "  api key: required — random per-job key"
+fi
 echo "================================================================"
 
 # ----- vLLM args (base + optional tool/reasoning) -----
@@ -201,8 +222,29 @@ if (exec 3<>/dev/tcp/127.0.0.1/__PORT__) 2>/dev/null; then
     exit 1
 fi
 
+# ---- API key. Reaches the server through the ENVIRONMENT only — never a command
+#      line (visible in ps) and never this job script or the logs. ----
+KEY_FILE=""
+if [ "__USE_API_KEY__" = "true" ]; then
+    # yours if VLLM_API_KEY was exported at submit time, else a random per-job key
+    [ -n "${VLLM_API_KEY:-}" ] || VLLM_API_KEY=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    [ -n "$VLLM_API_KEY" ] || { echo "[ERROR] could not generate an API key"; exit 1; }
+    export VLLM_API_KEY
+    KEY_FILE=__OUTPUT_DIR__/__JOB_NAME___${LSB_JOBID}.apikey
+    trap 'rm -f "$KEY_FILE"' EXIT
+    ( umask 077; printf '%s\n' "$VLLM_API_KEY" > "$KEY_FILE" ) && chmod 600 "$KEY_FILE" \
+        || { echo "[ERROR] could not write the API key file $KEY_FILE"; exit 1; }
+    echo "[info] API key required. Key file (owner-only, removed at job end): $KEY_FILE"
+else
+    unset VLLM_API_KEY
+    echo "[info] --no-api-key: the server accepts unauthenticated requests"
+fi
+
 if [ "__ENGINE__" = "apptainer" ]; then
     [ -r "__SIF__" ] || { echo "[ERROR] SIF not readable: __SIF__"; exit 1; }
+    # --cleanenv drops the host env; APPTAINERENV_* is the way to hand one variable through
+    unset APPTAINERENV_VLLM_API_KEY
+    [ -n "${VLLM_API_KEY:-}" ] && export APPTAINERENV_VLLM_API_KEY="$VLLM_API_KEY"
     T_LAUNCH=$(date +%s); echo "[timing] launch_epoch=$T_LAUNCH"
     apptainer exec --nv --cleanenv \
         --bind __MODEL__:/model:ro --bind /scratch/$USER \
@@ -210,7 +252,7 @@ if [ "__ENGINE__" = "apptainer" ]; then
         --env TMPDIR=/scratch/$USER,XDG_CACHE_HOME=$CACHE,TORCHINDUCTOR_CACHE_DIR=$CACHE/torchinductor,TRITON_CACHE_DIR=$CACHE/triton,HF_HOME=$CACHE/hf,VLLM_CACHE_ROOT=$CACHE/vllm,FLASHINFER_CUBIN_DIR=$CACHE/flashinfer \
         "__SIF__" vllm serve /model $VLLM_ARGS > "$CTR_LOG" 2>&1 &
     SRV_PID=$!; ALIVE(){ kill -0 $SRV_PID 2>/dev/null; }; STOP(){ kill $SRV_PID 2>/dev/null; wait $SRV_PID 2>/dev/null||true; }
-    trap STOP EXIT
+    trap 'STOP; rm -f "$KEY_FILE"' EXIT
 
 elif [ "__ENGINE__" = "podman" ]; then
     unset XDG_RUNTIME_DIR
@@ -219,12 +261,14 @@ elif [ "__ENGINE__" = "podman" ]; then
     podman info >/dev/null 2>&1 || { echo "[podman] resetting"; podman system reset -f; }
     CTR=__JOB_NAME___${LSB_JOBID}   # per-job name: a second job on this node can't clash with / remove ours
     # only reap the rootless pause process (catatonit) when no other container of ours is left on the node
-    trap 'podman rm -f "$CTR" 2>/dev/null; [ -n "$(podman ps -q 2>/dev/null)" ] || pkill -u $USER catatonit 2>/dev/null' EXIT
+    trap 'podman rm -f "$CTR" 2>/dev/null; [ -n "$(podman ps -q 2>/dev/null)" ] || pkill -u $USER catatonit 2>/dev/null; rm -f "$KEY_FILE"' EXIT
     T_LAUNCH=$(date +%s); echo "[timing] launch_epoch=$T_LAUNCH"
     podman pull "__IMAGE__"
+    # "-e VLLM_API_KEY" (name only) copies the value from this shell's environment
     podman run -d --name "$CTR" --device nvidia.com/gpu=all --ipc=host \
         -v __MODEL__:/model:ro -p __PORT__:__PORT__ \
         -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e VLLM_LOGGING_LEVEL=INFO \
+        ${VLLM_API_KEY:+-e VLLM_API_KEY} \
         --entrypoint vllm "__IMAGE__" serve /model $VLLM_ARGS
     podman logs -f "$CTR" > "$CTR_LOG" 2>&1 &
     ALIVE(){ [ "$(podman inspect -f '{{.State.Running}}' "$CTR" 2>/dev/null)" = "true" ]; }; STOP(){ podman rm -f "$CTR" 2>/dev/null||true; }
@@ -239,7 +283,7 @@ else  # venv
     T_LAUNCH=$(date +%s); echo "[timing] launch_epoch=$T_LAUNCH"
     vllm serve __MODEL__ $VLLM_ARGS > "$CTR_LOG" 2>&1 &
     SRV_PID=$!; ALIVE(){ kill -0 $SRV_PID 2>/dev/null; }; STOP(){ kill $SRV_PID 2>/dev/null; wait $SRV_PID 2>/dev/null||true; }
-    trap STOP EXIT
+    trap 'STOP; rm -f "$KEY_FILE"' EXIT
 fi
 
 echo "[info] waiting for /health on :__PORT__ (log: $CTR_LOG)"
@@ -252,6 +296,14 @@ done
 T_READY=$(date +%s)
 [ $READY -ne 1 ] && { echo "[ERROR] not ready in time"; tail -50 "$CTR_LOG"; exit 1; }
 
+# /health needs no key, so it could have been answered by another job's server that took
+# the port after the check above. Only OUR server accepts this job's key — verify that.
+if [ -n "${VLLM_API_KEY:-}" ] && ! python3 "__TEST_SCRIPT__" --url "http://127.0.0.1:__PORT__" --model "__SERVED_NAME__" --auth-check; then
+    echo "[ERROR] the server answering on :__PORT__ rejected this job's API key or does not serve __SERVED_NAME__ —"
+    echo "        most likely another job's server holds the port. Resubmit with a different --port. Tail of our log:"
+    tail -20 "$CTR_LOG"; exit 1
+fi
+
 echo "================================================================"
 echo "TIMING: launch -> ready = $((T_READY - T_LAUNCH)) s"
 grep -iE "loading (model )?weights took|Model loading took" "$CTR_LOG" | head -1
@@ -261,7 +313,9 @@ python3 "__TEST_SCRIPT__" --url "http://127.0.0.1:__PORT__" --model "__SERVED_NA
   && TEST_RC=0 || { TEST_RC=1; echo "[test] endpoint test FAILED (see $CTR_LOG)"; }
 
 if [ "__EXIT_AFTER_TEST__" = "true" ]; then echo "[info] --exit-after-test; stopping."; STOP; exit $TEST_RC
-else echo "[info] live at http://$(hostname -s)__DOMAIN__:__PORT__/v1  (model: __SERVED_NAME__)"; echo "[info] bkill $LSB_JOBID to stop."; wait; fi
+else echo "[info] live at http://$(hostname -s)__DOMAIN__:__PORT__/v1  (model: __SERVED_NAME__)"
+     [ -n "$KEY_FILE" ] && echo "[info] API key file: $KEY_FILE   (export VLLM_API_KEY=\$(cat $KEY_FILE))"
+     echo "[info] bkill $LSB_JOBID to stop."; wait; fi
 BODY_STATIC
 } > "$JOBFILE"
 
@@ -274,6 +328,7 @@ sed -i \
   -e "s|__OUTPUT_DIR__|${OUTPUT_DIR}|g" -e "s|__JOB_NAME__|${JOB_NAME}|g" \
   -e "s|__VLLM_ARGS__|${VLLM_ARGS}|g" -e "s|__EXIT_AFTER_TEST__|${EXIT_AFTER_TEST}|g" \
   -e "s|__TEST_SCRIPT__|${TEST_SCRIPT}|g" -e "s|__TOOLS_FLAG__|${TOOLS_FLAG}|g" \
+  -e "s|__USE_API_KEY__|${USE_API_KEY}|g" \
   "$JOBFILE"
 
 SUBMIT=$(bsub < "$JOBFILE") || { rm -f "$JOBFILE"; echo "ERROR: bsub submission failed" >&2; exit 1; }
@@ -281,6 +336,16 @@ echo "$SUBMIT"; rm -f "$JOBFILE"
 # "|| true": under set -e/pipefail a non-matching grep (or a transient bjobs error below) would abort silently
 JOBID=$(echo "$SUBMIT" | grep -oE 'Job <[0-9]+>' | grep -oE '[0-9]+' | head -1 || true)
 [ -n "$JOBID" ] || { echo "ERROR: could not parse a job id from the bsub output" >&2; exit 1; }
+
+KEY_FILE=""; WEBUI_OPTS=()
+if [ "$USE_API_KEY" = true ]; then
+    KEY_FILE="$OUTPUT_DIR/${JOB_NAME}_${JOBID}.apikey"
+    echo "API key file (owner-only; written when the job starts, removed when it ends):"
+    echo "  $KEY_FILE"
+    echo "  use it with:  export VLLM_API_KEY=\$(cat $KEY_FILE)"
+    WEBUI_OPTS+=(--api-key-file "$KEY_FILE")
+fi
+[ "$WEBUI_NO_AUTH" = true ] && WEBUI_OPTS+=(--no-auth)
 
 # ----- optional: launch Open WebUI pointed at wherever the model landed -----
 if [ "$WEBUI" = true ] && [ -n "$JOBID" ]; then
@@ -292,8 +357,8 @@ if [ "$WEBUI" = true ] && [ -n "$JOBID" ]; then
         { [ "$st" = "EXIT" ] || [ "$st" = "DONE" ]; } && { echo; echo "model job $st before starting; not launching webui"; exit 1; }
         echo -n "."; sleep 3
     done; echo
-    [ -n "$NODE" ] || { echo "model not running yet; launch webui manually once it is:"; echo "  $SCRIPT_DIR/serve_openwebui.sh --model-url http://<node>${DOMAIN}:${PORT}/v1"; exit 0; }
+    [ -n "$NODE" ] || { echo "model not running yet; launch webui manually once it is:"; echo "  $SCRIPT_DIR/serve_openwebui.sh --model-url http://<node>${DOMAIN}:${PORT}/v1 ${WEBUI_OPTS[*]:-}"; exit 0; }
     echo "Model landed on: $NODE (API http://${NODE}${DOMAIN}:${PORT}/v1). Model may still be loading."
     "$SCRIPT_DIR/serve_openwebui.sh" --model-url "http://${NODE}${DOMAIN}:${PORT}/v1" \
-        --port "$WEBUI_PORT" --queue "$WEBUI_QUEUE" --domain "$DOMAIN"
+        --port "$WEBUI_PORT" --queue "$WEBUI_QUEUE" --domain "$DOMAIN" ${WEBUI_OPTS[@]+"${WEBUI_OPTS[@]}"}
 fi

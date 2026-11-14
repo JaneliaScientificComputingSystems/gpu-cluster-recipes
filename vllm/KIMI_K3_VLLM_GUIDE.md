@@ -80,19 +80,24 @@ few minutes autotuning FP4-MoE kernels + capturing CUDA graphs before `/health` 
 
 ## Talking to Kimi-K3
 
-Standard OpenAI API (model id `kimi-k3`) — see the general guide §6 for curl/Python. One
-Kimi-specific quirk:
+Standard OpenAI API (model id `kimi-k3`) — see the general guide §6 for curl/Python. The server
+requires the job's **API key** by default: `serve_vllm.sh` prints the path of an owner-only key
+file (`<repo>/output/vllm_kimi-k3_<jobid>.apikey`); use `export VLLM_API_KEY=$(cat <that file>)`.
+Details and the `--no-api-key` opt-out are in the general guide §4. One Kimi-specific quirk:
 
 > **Preserved-thinking:** Kimi-K3 always returns a separate `reasoning_content`. For multi-turn
 > and tool calls, pass the assistant message back **verbatim** (including `reasoning_content` and
 > any `tool_calls`), not just `content`.
 
-For the browser UI, `--webui` (above) or `serve_openwebui.sh --model-url http://<node>.int.janelia.org:8000/v1`.
+For the browser UI, `--webui` (above) or `serve_openwebui.sh --model-url http://<node>.int.janelia.org:8000/v1
+--api-key-file <key file>`. The UI asks for a login; the first account created is the admin (general
+guide §7). Both the API and the UI are reached directly at `http://<node>.int.janelia.org:<port>` —
+no SSH tunnel.
 
 ---
 
 ## Everything else
 
-Engines & one-time setup, clients, Open WebUI details, SSH tunnels, tuning, and the full
+Engines & one-time setup, clients, Open WebUI details, direct access by node hostname, tuning, and the full
 troubleshooting table (including the `/nrs` `--cleanenv` fix, the bsub slot-ratio hang, CDI, and
 Fabric-Manager CUDA-802) are in **[VLLM_SERVING_GUIDE.md](VLLM_SERVING_GUIDE.md)**.

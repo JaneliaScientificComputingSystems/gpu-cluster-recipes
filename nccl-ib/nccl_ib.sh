@@ -11,12 +11,9 @@ export NCCL_P2P_DISABLE=0
 export NCCL_SHM_DISABLE=0
 export NCCL_BUFFSIZE=8388608
 export TORCH_NCCL_BLOCKING_WAIT=1
-export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=3600
+# 3600 s unless you exported your own value before submitting (yours wins)
+export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-3600}
 export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=NET
-# Whole-node (*_parallel) jobs own every GPU, so pin the full list. On any other
-# queue LSF assigned this job specific GPUs — keep its CUDA_VISIBLE_DEVICES.
-# (LSB_QUEUE unset = not known to be a shared-node job: keep the old behaviour.)
-case "${LSB_QUEUE:-}" in
-    ""|*_parallel) export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 ;;
-esac
+# CUDA_VISIBLE_DEVICES is deliberately NOT set here: LSF sets it to the GPUs it
+# assigned to the job (site rule: read it, never override it).

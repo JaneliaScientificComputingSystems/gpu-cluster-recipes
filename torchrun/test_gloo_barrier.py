@@ -6,15 +6,24 @@ steps), then rank 0 goes off and does a long SOLO computation (the held-out-mous
 fine-tune, up to 500 epochs) while the other ranks must wait. The question is what
 the other ranks wait ON:
 
-    MODE=nccl  -> dist.barrier() on the NCCL group. The NCCL watchdog (~480s, here
-                 forced low via TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC) declares the
-                 waiting ranks "stuck" and aborts the job.  Reproduces the hang.
+    MODE=nccl  -> dist.barrier() on the NCCL group. The NCCL watchdog
+                 (TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC) declares the waiting ranks
+                 "stuck" and aborts the job.  Reproduces the hang.
     MODE=gloo  -> dist.monitored_barrier() on a Gloo group, which is NOT governed
                  by the NCCL watchdog.  Survives the long rank-0 delay.  The fix.
 
-Env:
+Env (export before submitting — LSF carries the submission environment to the job):
     MODE        nccl | gloo            (default gloo)
-    SLEEP_S     rank-0 solo seconds    (default 540; > the 480s watchdog)
+    SLEEP_S     rank-0 solo seconds    (default 540; > PyTorch's ~480s default watchdog)
+    TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC
+                the watchdog. SLEEP_S must exceed it for MODE=nccl to reproduce.
+                Ethernet queues leave it at PyTorch's default (~480s), so the
+                default SLEEP_S works. InfiniBand queues default it to 3600 via
+                ../nccl-ib/nccl_ib*.sh, so there export a low value yourself:
+
+    TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=120 SLEEP_S=300 MODE=nccl \
+        ./submit_torchrun_job.sh 2 --queue=gpu_h200_parallel --venv=~/torch_env \
+        --job-name=gloo_barrier --walltime=0:30 --script=test_gloo_barrier.py
 """
 
 import os

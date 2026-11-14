@@ -32,6 +32,7 @@
 #   gpu_h100_parallel  -> 96 CPUs, 8 GPUs, InfiniBand NCCL  [default]
 #   gpu_l4_parallel    -> 64 CPUs, 8 GPUs, Ethernet NCCL
 #   gpu_a100_parallel  -> 48 CPUs, 4 GPUs, Ethernet NCCL
+#   gpu_rtx6000_parallel -> 128 CPUs, 8 GPUs, Ethernet NCCL
 #
 # Non-parallel queues (single node, flexible GPU count):
 #   gpu_b300           -> use --num-gpus=N (1-8), InfiniBand NCCL
@@ -39,6 +40,7 @@
 #   gpu_h100           -> use --num-gpus=N (1-8), InfiniBand NCCL
 #   gpu_l4             -> use --num-gpus=N (1-8), Ethernet NCCL
 #   gpu_a100           -> use --num-gpus=N (1-4), Ethernet NCCL
+#   gpu_rtx6000        -> use --num-gpus=N (1-8), Ethernet NCCL
 #===============================================================================
 
 usage() {
@@ -157,6 +159,12 @@ case $QUEUE_NAME in
         APP_PROFILE="parallel-48"
         NETWORK_BACKEND="ETH"
         ;;
+    gpu_rtx6000_parallel)
+        CPUS_PER_NODE=128
+        GPUS_PER_NODE=8
+        APP_PROFILE="parallel-128"
+        NETWORK_BACKEND="ETH"
+        ;;
     gpu_b300|gpu_h200|gpu_h100)
         PARALLEL_QUEUE=false
         GPUS_PER_NODE=${USER_NUM_GPUS:-1}
@@ -178,10 +186,17 @@ case $QUEUE_NAME in
         APP_PROFILE=""
         NETWORK_BACKEND="ETH"
         ;;
+    gpu_rtx6000)
+        PARALLEL_QUEUE=false
+        GPUS_PER_NODE=${USER_NUM_GPUS:-1}
+        CPUS_PER_NODE=${USER_NUM_CPUS:-$((GPUS_PER_NODE * 16))}
+        APP_PROFILE=""
+        NETWORK_BACKEND="ETH"
+        ;;
     *)
         echo "ERROR: Unsupported queue: $QUEUE_NAME"
-        echo "Parallel:     gpu_b300_parallel, gpu_h200_parallel, gpu_h100_parallel, gpu_l4_parallel, gpu_a100_parallel"
-        echo "Non-parallel: gpu_b300, gpu_h200, gpu_h100, gpu_l4, gpu_a100 (use --num-gpus=N)"
+        echo "Parallel:     gpu_b300_parallel, gpu_h200_parallel, gpu_h100_parallel, gpu_l4_parallel, gpu_a100_parallel, gpu_rtx6000_parallel"
+        echo "Non-parallel: gpu_b300, gpu_h200, gpu_h100, gpu_l4, gpu_a100, gpu_rtx6000 (use --num-gpus=N)"
         exit 1
         ;;
 esac
@@ -300,10 +315,7 @@ else
     ENV_BLOCK="${ENV_BLOCK}export NCCL_SHM_DISABLE=0"$'\n'
     ENV_BLOCK="${ENV_BLOCK}export NCCL_BUFFSIZE=8388608"$'\n'
     ENV_BLOCK="${ENV_BLOCK}export NCCL_DEBUG=INFO"$'\n'
-    # Whole-node (parallel) jobs own every GPU; elsewhere keep the GPUs LSF assigned
-    if [ "$PARALLEL_QUEUE" = true ]; then
-        ENV_BLOCK="${ENV_BLOCK}export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7"$'\n'
-    fi
+    # CUDA_VISIBLE_DEVICES is not set: LSF assigns it (site rule: never override it)
 fi
 
 # Splice ENV_BLOCK into worker script (replace the marker line)

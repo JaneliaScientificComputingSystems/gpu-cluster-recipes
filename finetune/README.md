@@ -166,17 +166,35 @@ InfiniBand NCCL env — HF Trainer reads them automatically):
     --model /misc/hf/Qwen/Qwen2.5-72B-Instruct --max-steps 50 \
     --output ../models/qwen72b_fsdp_sft
 
-# full run — whole dataset over 4 nodes
+# full run — whole dataset over 4 nodes. Set --walltime yourself: the launcher's default for
+# more than 2 nodes is 8:00, and a job killed at walltime loses everything not yet saved.
 ../torchrun/submit_torchrun_job.sh 4 --queue=gpu_h200_parallel --venv=~/unsloth_env \
-    --job-name=fsdp_sft --workdir=$PWD --script=$PWD/fsdp_sft.py -- \
+    --job-name=fsdp_sft --walltime=24:00 --workdir=$PWD --script=$PWD/fsdp_sft.py -- \
     --model /misc/hf/Qwen/Qwen2.5-72B-Instruct --epochs 1 --lr 1e-5
 ```
+
+**Checkpoints.** By default (`--save-steps 0`) the model is saved **once, at the end** — a run
+killed at walltime keeps nothing. `--save-steps N` writes a checkpoint to
+`<output>/checkpoint-N` every N optimizer steps and keeps only the newest. It is off by default
+because each one is expensive: a full fp32 copy of the model (~2× the bf16 size, ~290 GB for 72B),
+written by rank 0 while every other rank waits. Pick N so that a save happens every hour or
+few, not every few minutes. Checkpoints are **weights only** (no optimizer or LR-schedule state):
+to continue after a killed run, start a new job with `--model <output>/checkpoint-N`; the
+optimizer and schedule start fresh.
+
+**Save-time limit.** While rank 0 writes a checkpoint (periodic or final) the other ranks wait in
+an NCCL collective, which gives up after the process-group timeout (`--ddp-timeout`, default
+3600 s) and, on InfiniBand queues, the NCCL watchdog (`TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC`, 3600 s
+unless you export another value before submitting). A 72B save takes minutes; for a much larger
+model on slow storage raise both, e.g. `export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=7200` before
+submitting and `--ddp-timeout 7200` after the `--`.
 
 Key script options: `--model`, `--dataset` (same [dataset format](#the-dataset) as the LoRA example
 — HF Hub id or local `.jsonl`), `--layer-cls` (the transformer
 block to FSDP-wrap — `Qwen2DecoderLayer` for Qwen2.5, `LlamaDecoderLayer` for Llama, etc.),
 `--batch-size` (per-GPU micro-batch), `--grad-accum`, `--max-seq-len`, `--max-steps`/`--epochs`,
-`--attn` (`sdpa` default; `flash_attention_2` if installed). Effective batch =
+`--attn` (`sdpa` default; `flash_attention_2` if installed), `--save-steps` (periodic checkpoints,
+default 0 = off), `--ddp-timeout` (default 3600 s). Effective batch =
 `batch-size × grad-accum × world-size`.
 
 The **same script scales to larger dense models** by swapping `--model` (and `--layer-cls` if the

@@ -62,6 +62,13 @@ def main():
     p.add_argument("--attn", default="sdpa",
                    choices=["sdpa", "flash_attention_2", "eager"])
     p.add_argument("--output", default="../models/qwen72b_fsdp_sft")
+    p.add_argument("--save-steps", type=int, default=0,
+                   help="write a weights-only checkpoint to <output>/checkpoint-N every N optimizer "
+                        "steps, keeping only the newest, so a run killed at walltime keeps something. "
+                        "0 (default) = save only at the end. Each save is a full fp32 copy of the "
+                        "model (~2x the bf16 size) and stalls training while rank 0 writes it")
+    p.add_argument("--ddp-timeout", type=int, default=3600,
+                   help="process-group timeout in seconds; every checkpoint write must finish inside it")
     args = p.parse_args()
 
     import torch
@@ -113,7 +120,12 @@ def main():
         warmup_ratio=0.03,
         lr_scheduler_type="cosine",
         logging_steps=1,
-        save_strategy="no",
+        # Periodic checkpoints are opt-in (--save-steps). Weights only: they go through the
+        # same FULL_STATE_DICT gather as the final save, and skip the sharded optimizer state.
+        save_strategy="steps" if args.save_steps > 0 else "no",
+        save_steps=args.save_steps if args.save_steps > 0 else 500,
+        save_total_limit=1,
+        save_only_model=True,
         bf16=True,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
@@ -121,7 +133,7 @@ def main():
         dataset_text_field="text",
         max_length=args.max_seq_len,   # raw TRL 0.24 arg name (Unsloth patches it to max_seq_length)
         report_to="none",
-        ddp_timeout=3600,   # generous: 16 ranks each read ~140 GB from NFS before the first collective
+        ddp_timeout=args.ddp_timeout,   # generous default: 16 ranks each read ~140 GB from NFS before the first collective
         # ---- FSDP FULL_SHARD (ZeRO-3): shard params+grads+optimizer across all ranks ----
         fsdp="full_shard auto_wrap",
         fsdp_config={
@@ -151,7 +163,10 @@ def main():
 
     # Rank 0's full-checkpoint write (~140 GB for 72B) takes minutes while other ranks
     # would otherwise race to torchelastic's exit barrier and trip its 300 s timeout —
-    # so hold everyone here until the write finishes (uses the 3600 s process-group timeout).
+    # so hold everyone here until the write finishes. LIMIT: the wait is bounded by the
+    # process-group timeout (--ddp-timeout, default 3600 s) and, on InfiniBand queues, by
+    # TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC (3600 s unless exported before submitting). A write
+    # slower than that aborts the waiting ranks — raise both for models much larger than 72B.
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         torch.distributed.barrier()
 

@@ -114,7 +114,7 @@ directory, so `--script=<file>` is relative):
 | `test_torchrun.py` | Minimal NCCL sanity check — all-reduce/all-gather across every rank; fast (~30 s once running). |
 | `test_torchrun_soak.py` | Sustained small-message all-reduce over minutes — catches intermittent mid-run cross-node stalls the minimal test misses. Env tunables: `SOAK_ITERS`, `SOAK_NUMEL`, `SOAK_SLEEP`. |
 | `test_torchrun_ibstress.py` | Bandwidth stress — message-size sweep + sustained large-message all-reduce, reports algbw/busbw (GB/s) like `nccl-tests`. Args: `--sweep-min-mb`, `--max-mb`, `--secs`, `--dtype`. |
-| `test_gloo_barrier.py` | Reproduces the rank-0-stall vs NCCL-watchdog barrier deadlock (NCCL `barrier` vs Gloo `monitored_barrier`); `MODE=nccl` hangs, `MODE=gloo` survives. |
+| `test_gloo_barrier.py` | Reproduces the rank-0-stall vs NCCL-watchdog barrier deadlock (NCCL `barrier` vs Gloo `monitored_barrier`); `MODE=nccl` hangs, `MODE=gloo` survives. Env: `MODE`, `SLEEP_S`, `TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC` (see below). |
 
 ### Sanity check
 
@@ -130,6 +130,21 @@ Success prints `[PASS] ... all ranks` and, on IB, `NET/IB/*/GDRDMA` in the NCCL 
 > ✅ Validated 2026-08-08: `test_torchrun.py` passes across all ranks (a 2-node/16-GPU run measured
 > ~574 GB/s on the sanity all-reduce), and `test_gloo_barrier.py` in `MODE=gloo` clears the 16-rank
 > barrier that `MODE=nccl` deadlocks on — reproducing the rank-0-stall vs NCCL-watchdog fix.
+
+**Reproducing the barrier deadlock.** `MODE=nccl` only fails when rank 0's solo time (`SLEEP_S`,
+default 540) exceeds the NCCL watchdog, `TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC`. On Ethernet queues that
+is PyTorch's default (~480 s), so the defaults reproduce it. On InfiniBand queues `../nccl-ib/`
+defaults the watchdog to 3600 s, so export a lower value before submitting — a value you export
+wins over that default:
+
+```bash
+TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=120 SLEEP_S=300 MODE=nccl \
+    ./submit_torchrun_job.sh 2 --queue=gpu_h200_parallel --venv=~/torch_env \
+    --job-name=gloo_barrier --walltime=0:30 --script=test_gloo_barrier.py     # aborts
+SLEEP_S=300 MODE=gloo \
+    ./submit_torchrun_job.sh 2 --queue=gpu_h200_parallel --venv=~/torch_env \
+    --job-name=gloo_barrier --walltime=0:30 --script=test_gloo_barrier.py     # passes
+```
 
 ### Bandwidth stress (busbw)
 
