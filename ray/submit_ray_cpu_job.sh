@@ -175,7 +175,6 @@ done
 agent_grpc_port=\$((port_base + 1))
 agent_listen_port=\$((port_base + 2))
 dashboard_port=\$((port_base + 3))
-client_server_port=\$((port_base + 4))
 
 # Discover hosts and CPUs per host from LSF allocation
 declare -A host_cpus
@@ -217,7 +216,7 @@ port=\$(getfreeport)
 head_node=\${hosts[0]}
 echo ""
 echo "Head node: \$head_node  Port: \$port"
-echo "Per-job Ray ports: agent \$agent_grpc_port/\$agent_listen_port  dashboard \$dashboard_port  client server \$client_server_port"
+echo "Per-job Ray ports: agent \$agent_grpc_port/\$agent_listen_port  dashboard \$dashboard_port"
 
 echo ""
 echo "================================================================"
@@ -232,14 +231,20 @@ blaunch -z \$head_node "
         --num-gpus=0 \
         --temp-dir=\$RAY_TMPDIR \
         --dashboard-port=\$dashboard_port \
-        --ray-client-server-port=\$client_server_port \
         --dashboard-agent-grpc-port=\$agent_grpc_port \
         --dashboard-agent-listen-port=\$agent_listen_port
 " &
 
+head_launch_pid=\$!
+wait_start=\$SECONDS
 sleep 20
 waited=20
-while ! ray status --address \$head_node:\$port 2>/dev/null; do
+while ! timeout 30 ray status --address \$head_node:\$port 2>/dev/null; do
+    # 'ray start' returns once the head is up; a non-zero exit means it failed
+    if ! kill -0 \$head_launch_pid 2>/dev/null && ! wait \$head_launch_pid; then
+        echo "ERROR: 'ray start --head' failed on \$head_node — see the error above"
+        exit 1
+    fi
     if [ \$waited -ge \$RAY_START_TIMEOUT ]; then
         echo "ERROR: Ray head node on \$head_node did not start within \${RAY_START_TIMEOUT}s"
         echo "       Check --venv (${VENV_PATH}) and the 'ray start' errors above."
@@ -247,14 +252,14 @@ while ! ray status --address \$head_node:\$port 2>/dev/null; do
     fi
     echo "Waiting for Ray head node..."
     sleep 3
-    waited=\$((waited + 3))
+    waited=\$((SECONDS - wait_start))
 done
 echo "Ray head node ready"
 
 # Number of live nodes the head reports ("Active:" section of ray status).
 # Prints 0 if the output cannot be parsed.
 function ray_node_count() {
-    ray status --address \$head_node:\$port 2>/dev/null | awk '
+    timeout 30 ray status --address \$head_node:\$port 2>/dev/null | awk '
         /^(Active|Healthy):/ { in_active = 1; next }
         /^[A-Za-z]/          { in_active = 0 }
         in_active && \$1 ~ /^[0-9]+\$/ { n += \$1 }
@@ -274,22 +279,24 @@ if [ \$num_nodes -gt 1 ]; then
                 --dashboard-agent-grpc-port=\$agent_grpc_port \
                 --dashboard-agent-listen-port=\$agent_listen_port
         " &
+        wait_start=\$SECONDS
         sleep 10
         waited=10
-        while ! blaunch -z \$host ray status --address \$head_node:\$port 2>/dev/null; do
+        while ! timeout 60 blaunch -z \$host ray status --address \$head_node:\$port 2>/dev/null; do
             if [ \$waited -ge \$RAY_START_TIMEOUT ]; then
                 echo "ERROR: worker \$host could not reach the Ray head within \${RAY_START_TIMEOUT}s"
                 exit 1
             fi
             echo "Waiting for worker \$host..."
             sleep 3
-            waited=\$((waited + 3))
+            waited=\$((SECONDS - wait_start))
         done
         echo "Worker \$host started"
     done
 
     # The check above only proves the head is reachable from each worker.
     # Confirm that every node actually joined before starting the script.
+    wait_start=\$SECONDS
     waited=0
     nodes_up=\$(ray_node_count)
     while [ "\$nodes_up" -gt 0 ] && [ "\$nodes_up" -lt \$num_nodes ]; do
@@ -300,7 +307,7 @@ if [ \$num_nodes -gt 1 ]; then
         fi
         echo "Waiting for nodes to join: \$nodes_up/\$num_nodes"
         sleep 3
-        waited=\$((waited + 3))
+        waited=\$((SECONDS - wait_start))
         nodes_up=\$(ray_node_count)
     done
     if [ "\$nodes_up" -eq 0 ]; then
