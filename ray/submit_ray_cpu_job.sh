@@ -176,6 +176,24 @@ agent_grpc_port=\$((port_base + 1))
 agent_listen_port=\$((port_base + 2))
 dashboard_port=\$((port_base + 3))
 
+# Worker ports. Every Ray cluster hands its workers ports from 10002-19999 by
+# default, so two clusters starting on one shared node give out the same ports:
+# the workers crash on bind and the driver hangs in ray.init(). Each job gets
+# its own range of 500 ports in 10000-19999, moved on if anything on this host
+# already listens inside it.
+function range_free() {
+    ss -tln 2>/dev/null | awk -v lo=\$1 -v hi=\$2 '
+        { n = split(\$4, a, ":"); p = a[n] + 0; if (p >= lo && p <= hi) busy = 1 }
+        END { exit busy }'
+}
+worker_slot=\$(( \${LSB_JOBID:-0} % 20 ))
+for try in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    min_worker_port=\$(( 10000 + worker_slot * 500 ))
+    max_worker_port=\$(( min_worker_port + 499 ))
+    range_free \$min_worker_port \$max_worker_port && break
+    worker_slot=\$(( (worker_slot + 1) % 20 ))
+done
+
 # Discover hosts and CPUs per host from LSF allocation
 declare -A host_cpus
 for host in \$(cat \$LSB_DJOB_HOSTFILE); do
@@ -216,7 +234,7 @@ port=\$(getfreeport)
 head_node=\${hosts[0]}
 echo ""
 echo "Head node: \$head_node  Port: \$port"
-echo "Per-job Ray ports: agent \$agent_grpc_port/\$agent_listen_port  dashboard \$dashboard_port"
+echo "Per-job Ray ports: agent \$agent_grpc_port/\$agent_listen_port  dashboard \$dashboard_port  workers \$min_worker_port-\$max_worker_port"
 
 echo ""
 echo "================================================================"
@@ -232,7 +250,9 @@ blaunch -z \$head_node "
         --temp-dir=\$RAY_TMPDIR \
         --dashboard-port=\$dashboard_port \
         --dashboard-agent-grpc-port=\$agent_grpc_port \
-        --dashboard-agent-listen-port=\$agent_listen_port
+        --dashboard-agent-listen-port=\$agent_listen_port \
+        --min-worker-port=\$min_worker_port \
+        --max-worker-port=\$max_worker_port
 " &
 
 head_launch_pid=\$!
@@ -277,7 +297,9 @@ if [ \$num_nodes -gt 1 ]; then
                 --num-gpus=0 \
                 --temp-dir=\$RAY_TMPDIR \
                 --dashboard-agent-grpc-port=\$agent_grpc_port \
-                --dashboard-agent-listen-port=\$agent_listen_port
+                --dashboard-agent-listen-port=\$agent_listen_port \
+                --min-worker-port=\$min_worker_port \
+                --max-worker-port=\$max_worker_port
         " &
         wait_start=\$SECONDS
         sleep 10
