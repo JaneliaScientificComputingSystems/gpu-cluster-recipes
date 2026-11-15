@@ -175,6 +175,11 @@ done
 agent_grpc_port=\$((port_base + 1))
 agent_listen_port=\$((port_base + 2))
 dashboard_port=\$((port_base + 3))
+# The Ray Client server only starts when its dependencies are installed
+# (ray[client]); 'ray start' rejects the port flag without them. When they are,
+# move it off the fixed default 10001 so two clusters on one host do not collide.
+client_flag=""
+python -c 'import grpc' 2>/dev/null && client_flag="--ray-client-server-port=\$((port_base + 4))"
 
 # Worker ports. Every Ray cluster hands its workers ports from 10002-19999 by
 # default, so two clusters starting on one shared node give out the same ports:
@@ -186,11 +191,25 @@ function range_free() {
         { n = split(\$4, a, ":"); p = a[n] + 0; if (p >= lo && p <= hi) busy = 1 }
         END { exit busy }'
 }
+# Jobs that start in the same second cannot see each other's listeners yet, so
+# a range is also claimed with an atomic mkdir on this host. A claim only has
+# to cover the startup window: one older than 3 minutes is taken over.
+port_claims=/scratch/\$(whoami)/.ray_port_claims
+port_claim=""
+function claim_slot() {
+    local d=\$port_claims/slot_\$1
+    mkdir -p \$port_claims 2>/dev/null
+    if mkdir \$d 2>/dev/null; then port_claim=\$d; return 0; fi
+    if [ -n "\$(find \$d -maxdepth 0 -mmin +3 2>/dev/null)" ]; then
+        touch \$d; port_claim=\$d; return 0
+    fi
+    return 1
+}
 worker_slot=\$(( \${LSB_JOBID:-0} % 20 ))
 for try in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
     min_worker_port=\$(( 10000 + worker_slot * 500 ))
     max_worker_port=\$(( min_worker_port + 499 ))
-    range_free \$min_worker_port \$max_worker_port && break
+    range_free \$min_worker_port \$max_worker_port && claim_slot \$worker_slot && break
     worker_slot=\$(( (worker_slot + 1) % 20 ))
 done
 
@@ -218,6 +237,7 @@ cleanup_done=0
 function cleanup() {
     [ \$cleanup_done -eq 1 ] && return
     cleanup_done=1
+    [ -n "\$port_claim" ] && rmdir \$port_claim 2>/dev/null
     for host in "\${hosts[@]}"; do
         blaunch -z \$host "\$(declare -f stop_job_ray); stop_job_ray '\$RAY_TMPDIR' '\$RAY_JOB_TAG'" &
     done
@@ -245,6 +265,7 @@ blaunch -z \$head_node "
     if [ -n '${VENV_PATH}' ]; then source ${VENV_PATH}/bin/activate; fi
     export LSF_RAY_JOB_TAG=\$RAY_JOB_TAG
     ray start --head --port \$port \
+        \$client_flag \
         --num-cpus=\${host_cpus[\$head_node]} \
         --num-gpus=0 \
         --temp-dir=\$RAY_TMPDIR \
