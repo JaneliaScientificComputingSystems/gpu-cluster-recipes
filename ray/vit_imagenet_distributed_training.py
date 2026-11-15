@@ -288,10 +288,6 @@ def train_func(config):
         elapsed = time.time() - t0
         img_sec = g_total / max(elapsed, 1)
 
-        if config.get("save_models"):
-            save_checkpoint(model, optimizer, epoch, train_top1, 0, best_top1,
-                            config, is_best=False, world_rank=world_rank)
-
         # Validation
         val_top1 = 0
         val_top5 = 0
@@ -330,6 +326,11 @@ def train_func(config):
                 save_checkpoint(model, optimizer, epoch, val_top1, val_top5,
                                 best_top1, config, is_best=True,
                                 world_rank=world_rank)
+
+        # Save latest after validation, so the best score it stores is current
+        if config.get("save_models"):
+            save_checkpoint(model, optimizer, epoch, train_top1, 0, best_top1,
+                            config, is_best=False, world_rank=world_rank)
 
         ray.train.report({
             "epoch": epoch, "train_loss": train_loss,

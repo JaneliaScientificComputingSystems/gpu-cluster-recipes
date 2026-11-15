@@ -406,10 +406,6 @@ def main():
         elapsed = time.time() - t0
         img_sec = images_processed * world_size / max(elapsed, 1)
 
-        if args.save_models and world_rank == 0:
-            save_checkpoint(model, optimizer, epoch, train_top1, 0, best_top1,
-                            args, is_best=False)
-
         # -------------------------------------------------------------------
         # Validation
         # -------------------------------------------------------------------
@@ -449,6 +445,11 @@ def main():
             if args.save_models and is_best and world_rank == 0:
                 save_checkpoint(model, optimizer, epoch, val_top1, val_top5,
                                 best_top1, args, is_best=True)
+
+        # Save latest after validation, so the best score it stores is current
+        if args.save_models and world_rank == 0:
+            save_checkpoint(model, optimizer, epoch, train_top1, 0, best_top1,
+                            args, is_best=False)
 
         if world_rank == 0:
             val_str = (f"val_top1={val_top1:.2f}% val_top5={val_top5:.2f}%"

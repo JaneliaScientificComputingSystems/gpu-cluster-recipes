@@ -460,11 +460,6 @@ def train_func(config):
         g_loss, g_batches = global_sum([epoch_loss, num_batches], device)
         train_loss = g_loss / max(g_batches, 1)
 
-        # Save latest
-        if config.get("save_models"):
-            save_checkpoint(model, optimizer, epoch, best_miou, best_miou,
-                            config, is_best=False, world_rank=world_rank)
-
         # Validation
         val_miou = 0
         if (epoch + 1) % config.get("eval_interval", 5) == 0 or epoch == config["epochs"] - 1:
@@ -497,6 +492,11 @@ def train_func(config):
             if config.get("save_models") and is_best:
                 save_checkpoint(model, optimizer, epoch, val_miou, best_miou,
                                 config, is_best=True, world_rank=world_rank)
+
+        # Save latest after validation, so the best score it stores is current
+        if config.get("save_models"):
+            save_checkpoint(model, optimizer, epoch, best_miou, best_miou,
+                            config, is_best=False, world_rank=world_rank)
 
         ray.train.report({
             "epoch": epoch, "train_loss": train_loss,
