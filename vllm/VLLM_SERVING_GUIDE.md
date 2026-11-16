@@ -138,8 +138,6 @@ cat > ~/.config/containers/containers.conf <<'EOF'
 [engine]
 cgroup_manager = "cgroupfs"
 events_logger = "file"
-[network]
-network_backend = "cni"
 EOF
 cat > ~/.config/containers/registries.conf <<'EOF'
 unqualified-search-registries = ["docker.io"]
