@@ -170,13 +170,16 @@ How it differs from a normal run:
   other nodes, runs the script and stops Ray. Each other node's sandbox joins and stays until
   its raylet exits. Without `--sandbox`, Ray daemons are left on each node and the script runs
   in the job script.
-- **Ray's ports are fixed** (10101 to 13999), because a limited network lets other nodes in on
-  ports 10000 to 14999 only. Each sandbox has its own network, so the fixed ports do not
-  collide with another job on the same node.
+- **Ray's ports are fixed**, because a limited network lets other nodes in on one block of
+  2000 ports only (13000 to 14999 when the job has its nodes to itself). The launcher takes
+  them from the lowest 500 of the sandbox's block. Each sandbox has its own network, so the
+  fixed ports do not collide with another job on the same node.
 - **With `podman` the image is pulled on every node first** (about two minutes for the default
   image on a node that does not have it yet), and a host venv does not work inside it.
 - **Tested:** CIFAR-10, 10 epochs, two H200 nodes: 71.4% with `bwrap`, 71.8% with `podman`,
   both over InfiniBand; one node with two GPUs with `bwrap`. The Ethernet path is not run yet.
+- **One node on an InfiniBand queue:** the sandbox has no network, so the launcher drops the
+  network interface that the NCCL settings name; NCCL then uses the loopback.
 
 ## CPU Submission Script
 

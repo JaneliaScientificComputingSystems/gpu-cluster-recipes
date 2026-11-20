@@ -270,9 +270,10 @@ mkdir -p ../output
 #   Ethernet queues    --host-net       : the node's own network (the limited one is too slow
 #                      when NCCL's data travels over TCP)
 #   one node           no network: Ray runs on the sandbox's own loopback
-# With a limited network other nodes reach a sandbox on ports 10000-14999 only, so every Ray
-# port is fixed inside that block; each sandbox has its own network namespace (or, on Ethernet
-# parallel queues, a whole node), so fixed ports cannot collide with another job.
+# With a limited network other nodes reach a sandbox on one block of 2000 ports only (13000-14999
+# when the node is the job's own), so every Ray port is fixed inside the sandbox's block; each
+# sandbox has its own network namespace (or, on Ethernet parallel queues, a whole node), so
+# fixed ports cannot collide with another job.
 #===============================================================================
 if [ -n "$SANDBOX" ]; then
     case "$SANDBOX" in
@@ -340,11 +341,14 @@ if [ -n "$SANDBOX" ]; then
     # ---- runs INSIDE the sandbox, once per node: ROLE MY_ADDR HEAD_ADDR NUM_NODES
     {
         echo '#!/bin/bash'
-        echo 'ROLE=$1 MYIP=$2 HEAD=$3 NODES=$4'
+        echo 'ROLE=$1 MYIP=$2 HEAD=$3 NODES=$4 JOB=$5'
         echo "export USER=$(printf '%q' "$USER") LOGNAME=$(printf '%q' "$USER") PYTHONUNBUFFERED=1 RAY_USAGE_STATS_ENABLED=0"
         [ -n "$VENV_ABS" ] && echo "source $(printf '%q' "$VENV_ABS/bin/activate")"
         if [ "$NETWORK_BACKEND" = "IB" ]; then
             echo "source $(printf '%q' "$NCCL_ENV_FILE") || exit 1"
+            # One node: the sandbox has no network, only its own loopback, and the interface
+            # the settings name does not exist in it. NCCL then finds the loopback by itself.
+            echo '[ "$NODES" -eq 1 ] && unset NCCL_SOCKET_IFNAME'
         else
             echo 'export NCCL_IB_DISABLE=1 NCCL_NET_GDR_LEVEL=0 NCCL_P2P_DISABLE=0 NCCL_SHM_DISABLE=0 NCCL_BUFFSIZE=8388608 NCCL_DEBUG=INFO'
         fi
@@ -353,14 +357,20 @@ if [ -n "$SANDBOX" ]; then
         cat << 'INNER_EOF'
 h=$(hostname -s)
 PY=$(command -v python || command -v python3)
-GCS=10101
-# Every port another node connects to is fixed inside 10000-13999; ports Ray lets the system
-# pick come from the sandbox's own range, 14000-14999.
+# Every port another node connects to is fixed. In a sandbox with a limited network they must
+# lie in its block of 2000 ports: the sandbox's own range for ports the system picks is the
+# top 1500 of the block, so the fixed ones go in the 500 below that. Elsewhere (the node's
+# own network, or one node) they start at 10000.
+read -r elo ehi < /proc/sys/net/ipv4/ip_local_port_range
+if [ $((ehi - elo)) -eq 1499 ]; then B=$((elo - 500)); else B=10000; fi
+GCS=$((B + 1))
+# The head's block can differ from this node's when the nodes are shared: the head says which.
+GCS_FILE=.ray_gcs_$JOB
 COMMON=(--node-ip-address="$MYIP" --num-cpus="$CPUS" --num-gpus="$GPUS"
-        --node-manager-port=10102 --object-manager-port=10103
-        --dashboard-agent-grpc-port=10105 --dashboard-agent-listen-port=10106
-        --metrics-export-port=10107 --runtime-env-agent-port=10108
-        --min-worker-port=11000 --max-worker-port=13999)
+        --node-manager-port=$((B + 2)) --object-manager-port=$((B + 3))
+        --dashboard-agent-grpc-port=$((B + 5)) --dashboard-agent-listen-port=$((B + 6))
+        --metrics-export-port=$((B + 7)) --runtime-env-agent-port=$((B + 8))
+        --min-worker-port=$((B + 100)) --max-worker-port=$((B + 499)))
 nodes_up() {
     timeout 30 ray status --address "$HEAD:$GCS" 2>/dev/null | awk '
         /^(Active|Healthy):/ { a = 1; next } /^[A-Za-z]/ { a = 0 }
@@ -368,8 +378,9 @@ nodes_up() {
 }
 echo "[sandbox $h] role=$ROLE address=$MYIP gpus=$(nvidia-smi -L 2>/dev/null | wc -l) $(ray --version 2>&1 | tail -1)"
 if [ "$ROLE" = head ]; then
-    ray start --head --port="$GCS" --dashboard-port=10104 --temp-dir=/tmp/ray "${COMMON[@]}" \
+    ray start --head --port="$GCS" --dashboard-port=$((B + 4)) --temp-dir=/tmp/ray "${COMMON[@]}" \
         || { echo "ERROR: 'ray start --head' failed on $h"; exit 1; }
+    echo "$GCS" > "$GCS_FILE.tmp" && mv "$GCS_FILE.tmp" "$GCS_FILE"
     n=0
     for i in $(seq 1 100); do
         n=$(nodes_up); [ "$n" -ge "$NODES" ] && break
@@ -389,6 +400,9 @@ if [ "$ROLE" = head ]; then
     ray stop >/dev/null 2>&1
     exit $rc
 else
+    for i in $(seq 1 150); do [ -s "$GCS_FILE" ] && break; sleep 2; done
+    [ -s "$GCS_FILE" ] || { echo "ERROR: $h: the Ray head did not start within 5 minutes"; exit 1; }
+    GCS=$(cat "$GCS_FILE")
     joined=0
     for i in $(seq 1 60); do
         ray start --address="$HEAD:$GCS" "${COMMON[@]}" && { joined=1; break; }
@@ -428,7 +442,7 @@ open(p, 'w').write(s.replace('__SCRIPT_CMD__', cmd))
         echo 'fi'
         printf 'exec %q --gpu "${NET[@]}"' "$SANDBOX_DIR/$SANDBOX_WRAPPER"
         for a in ${SB_EXTRA[@]+"${SB_EXTRA[@]}"} ${SB_MOUNTS[@]+"${SB_MOUNTS[@]}"}; do printf ' %q' "$a"; done
-        printf ' -- %q "$ROLE" "$MYIP" "$HEAD" "$NODES"\n' "$SB_INNER"
+        printf ' -- %q "$ROLE" "$MYIP" "$HEAD" "$NODES" "$LSB_JOBID"\n' "$SB_INNER"
     } > "$SB_NODE"
     chmod +x "$SB_INNER" "$SB_NODE"
 
@@ -463,7 +477,7 @@ echo "Host list: \${hosts[@]}"
 echo "Nodes: \$NODES | GPUs: ${TOTAL_GPUS} | Network: ${NETWORK_BACKEND} | Sandbox: ${SANDBOX}"
 echo "Head node: \$head_node (\$HEAD_ADDR)"
 
-trap 'rm -f $(printf '%q' "$SB_INNER") $(printf '%q' "$SB_NODE")' EXIT
+trap 'rm -f $(printf '%q' "$SB_INNER") $(printf '%q' "$SB_NODE") $(printf '%q' "$SUBMIT_DIR")/.ray_gcs_\$LSB_JOBID' EXIT
 trap 'echo "Job interrupted by signal"; exit 143' INT TERM USR2
 
 # --sandbox=podman: every node keeps its own image store; a node that still has to pull would

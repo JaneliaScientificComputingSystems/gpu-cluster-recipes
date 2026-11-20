@@ -94,6 +94,10 @@ Limits:
   for the default image on a node that does not have it yet).
 - Measured on two H200 nodes with `test_torchrun_ibstress.py`: 481 GB/s sustained with either
   sandbox, against 482 without.
+- Also run: two L4 nodes over Ethernet, 6.5 GB/s with `bwrap` and 6.3 GB/s with `podman`; one
+  node with two GPUs with `bwrap`.
+- The cluster accepts a multi-node GPU job only on a `*_parallel` queue and only with whole
+  nodes, which is what this launcher asks for. Each sandbox therefore has its node to itself.
 
 ## Example: ViT on ImageNet-1K (`vit_imagenet_torchrun.py`)
 

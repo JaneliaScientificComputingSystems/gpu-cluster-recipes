@@ -326,6 +326,9 @@ ENV_BLOCK="${ENV_BLOCK}"'export PYTHONPATH="${PYTHONPATH}:'"${WORK_DIR}"'"'$'\n'
 # NCCL configuration
 if [ "$NETWORK_BACKEND" = "IB" ] && [ -f "$NCCL_ENV_FILE" ]; then
     ENV_BLOCK="${ENV_BLOCK}source $(printf '%q' "${NCCL_ENV_FILE}")"$'\n'
+    # --sandbox on one node: the sandbox has no network, only its own loopback, and the
+    # interface the settings name does not exist in it. NCCL then finds the loopback by itself.
+    [ -n "$SANDBOX" ] && [ "$NUM_NODES" -eq 1 ] && ENV_BLOCK="${ENV_BLOCK}unset NCCL_SOCKET_IFNAME"$'\n'
 else
     ENV_BLOCK="${ENV_BLOCK}export NCCL_IB_DISABLE=1"$'\n'
     ENV_BLOCK="${ENV_BLOCK}export NCCL_NET_GDR_LEVEL=0"$'\n'
