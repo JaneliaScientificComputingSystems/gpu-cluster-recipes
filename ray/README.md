@@ -125,6 +125,59 @@ Script args go after '--':
     --script=train.py -- --num-gpus=2 --num-nodes=1
 ```
 
+### Running Ray in a sandbox (`--sandbox`)
+
+`--sandbox=bwrap` or `--sandbox=podman` runs Ray and your script inside a sandbox from
+[agentic-sandbox](https://github.com/JaneliaScientificComputingSystems/agentic-sandbox), one per
+node. The launcher and the job script stay outside. Use it for code you did not write yourself,
+such as code an AI agent wrote: the sandbox sees the directory you submit from, `../output` and
+what you name with `--ro`/`--rw`, and nothing else of your account (no home directory, keys or
+tokens).
+
+```bash
+# Bubblewrap, with your venv
+./submit_ray_job.sh 2 --queue=gpu_h200_parallel --venv=~/ray_env --sandbox=bwrap \
+    --ro=/nrs/ml_datasets --rw=/scratch/$USER/ray_results \
+    --script=cifar10_distributed_training.py -- --num-gpus=16 --num-nodes=2 --epochs=10
+
+# podman, with the image's own PyTorch and Ray (no --venv)
+./submit_ray_job.sh 2 --queue=gpu_h200_parallel --sandbox=podman \
+    --ro=/nrs/ml_datasets --rw=/scratch/$USER/ray_results \
+    --script=cifar10_distributed_training.py -- --num-gpus=16 --num-nodes=2 --epochs=10
+```
+
+| Option | Meaning |
+|---|---|
+| `--sandbox=bwrap\|podman` | which sandbox |
+| `--sandbox-dir=PATH` | where `sandbox-run.sh` / `podman-run.sh` live; default `$AGENTIC_SANDBOX_DIR`, else `PATH` |
+| `--image=IMAGE` | podman only; default `agentic-sandbox-gpu` (PyTorch, NCCL, Ray, InfiniBand libraries) |
+| `--ro=PATH`, `--rw=PATH` | extra directories the sandbox may read / write (repeatable). A `--rw` directory is created on every node if missing |
+
+Name every directory the script reads or writes outside the submission directory. The examples
+here read `/nrs/ml_datasets` and write Ray's results to `/scratch/$USER/ray_results`.
+
+The launcher picks the network from the queue; there is nothing to choose:
+
+| Queue | Network inside the sandbox |
+|---|---|
+| InfiniBand (B300, H200, H100), 2+ nodes | the other nodes of this job only: no internet, no other host. NCCL's data goes over InfiniBand directly |
+| Ethernet (L4, A100, RTX 6000), 2+ nodes | the node's own network, not limited |
+| one node | none; Ray runs on the sandbox's own loopback |
+
+How it differs from a normal run:
+
+- **One sandbox per node holds everything.** The head node's sandbox starts Ray, waits for the
+  other nodes, runs the script and stops Ray. Each other node's sandbox joins and stays until
+  its raylet exits. Without `--sandbox`, Ray daemons are left on each node and the script runs
+  in the job script.
+- **Ray's ports are fixed** (10101 to 13999), because a limited network lets other nodes in on
+  ports 10000 to 14999 only. Each sandbox has its own network, so the fixed ports do not
+  collide with another job on the same node.
+- **With `podman` the image is pulled on every node first** (about two minutes for the default
+  image on a node that does not have it yet), and a host venv does not work inside it.
+- **Tested:** CIFAR-10, 10 epochs, two H200 nodes: 71.4% with `bwrap`, 71.8% with `podman`,
+  both over InfiniBand; one node with two GPUs with `bwrap`. The Ethernet path is not run yet.
+
 ## CPU Submission Script
 
 For CPU-only workloads (data pipelines, ETL, analysis) — no GPUs:

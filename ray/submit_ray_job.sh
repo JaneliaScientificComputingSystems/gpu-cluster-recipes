@@ -51,6 +51,14 @@ usage() {
     echo "  --job-name=NAME      Job name (default: ray_job)"
     echo "  --walltime=TIME      Walltime in hours (default: 24:00 non-parallel, auto parallel)"
     echo "  --venv=PATH          Python venv path"
+    echo "  --sandbox=KIND       Run Ray and the script in one sandbox per node: bwrap or podman"
+    echo "                       (agentic-sandbox). The network is chosen by queue: InfiniBand queues"
+    echo "                       reach the job's own nodes only; Ethernet queues keep the node's network."
+    echo "  --sandbox-dir=PATH   Where sandbox-run.sh / podman-run.sh live (default: \$AGENTIC_SANDBOX_DIR,"
+    echo "                       else wherever they are found on PATH)"
+    echo "  --image=IMAGE        Container image for --sandbox=podman (default: agentic-sandbox-gpu)"
+    echo "  --ro=PATH, --rw=PATH Extra directory the sandbox may read / write (repeatable): datasets,"
+    echo "                       and where the script writes (e.g. --rw=/scratch/\$USER/ray_results)"
     echo ""
     echo "Script arguments: use '--' separator"
     echo "  Example: $0 2 --script=train.py -- --epochs=50 --batch-size=128"
@@ -71,6 +79,20 @@ VENV_PATH=""
 SCRIPT_ARGS=""
 USER_NUM_GPUS=""
 USER_NUM_CPUS=""
+SANDBOX=""
+SANDBOX_DIR="${AGENTIC_SANDBOX_DIR:-}"
+SANDBOX_IMAGE="ghcr.io/janeliascientificcomputingsystems/agentic-sandbox-gpu:latest"
+SANDBOX_RO=()
+SANDBOX_RW=()
+
+# bash does not expand "~" inside --opt=~/path, so do it for the sandbox's path options
+expand_tilde() {
+    case "$1" in
+        "~")    echo "$HOME" ;;
+        "~/"*)  echo "$HOME/${1#\~/}" ;;
+        *)      echo "$1" ;;
+    esac
+}
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -81,6 +103,11 @@ while [[ $# -gt 0 ]]; do
         --job-name=*) JOB_NAME="${1#*=}"; shift ;;
         --walltime=*) WALLTIME="${1#*=}"; shift ;;
         --venv=*)     VENV_PATH="${1#*=}"; shift ;;
+        --sandbox=*)     SANDBOX="${1#*=}"; shift ;;
+        --sandbox-dir=*) SANDBOX_DIR="$(expand_tilde "${1#*=}")"; shift ;;
+        --image=*)       SANDBOX_IMAGE="${1#*=}"; shift ;;
+        --ro=*)          SANDBOX_RO+=("$(expand_tilde "${1#*=}")"); shift ;;
+        --rw=*)          SANDBOX_RW+=("$(expand_tilde "${1#*=}")"); shift ;;
         --) shift; SCRIPT_ARGS=$(printf '%q ' "$@"); break ;;
         *) echo "Unknown option: $1"; usage ;;
     esac
@@ -224,6 +251,273 @@ esac
 
 # LSF does not create the log directory; without it the job output is lost
 mkdir -p ../output
+
+#===============================================================================
+# --sandbox: Ray and the script run inside one agentic-sandbox sandbox per node
+# (sandbox-run.sh = Bubblewrap, podman-run.sh = a container). This launcher and the job
+# script stay outside. Use it for code you did not write yourself, such as code an AI agent
+# wrote: the sandbox sees the submission directory, ../output and what --ro/--rw name, and
+# nothing else of your account (no home directory, keys or tokens).
+#
+# The shape differs from the unsandboxed path below, where 'ray start' leaves daemons on each
+# node and the script runs in the job script. A sandbox ends with its command, so:
+#   head node     one sandbox: ray start --head, wait for the nodes, run the script, ray stop
+#   other nodes   one sandbox each: ray start --address, then stay until the raylet exits
+#
+# The network is chosen here, by queue, never by the user:
+#   InfiniBand queues  --ib --job-nodes : TCP reaches the other nodes of this job only; NCCL's
+#                      data goes over InfiniBand at full speed
+#   Ethernet queues    --host-net       : the node's own network (the limited one is too slow
+#                      when NCCL's data travels over TCP)
+#   one node           no network: Ray runs on the sandbox's own loopback
+# With a limited network other nodes reach a sandbox on ports 10000-14999 only, so every Ray
+# port is fixed inside that block; each sandbox has its own network namespace (or, on Ethernet
+# parallel queues, a whole node), so fixed ports cannot collide with another job.
+#===============================================================================
+if [ -n "$SANDBOX" ]; then
+    case "$SANDBOX" in
+        bwrap)  SANDBOX_WRAPPER="sandbox-run.sh" ;;
+        podman) SANDBOX_WRAPPER="podman-run.sh" ;;
+        *) echo "ERROR: --sandbox takes bwrap or podman (got '$SANDBOX')"; exit 1 ;;
+    esac
+    if [ -z "$SANDBOX_DIR" ]; then
+        found=$(command -v "$SANDBOX_WRAPPER" 2>/dev/null) && SANDBOX_DIR=$(dirname "$(readlink -f "$found")")
+    fi
+    [ -d "$SANDBOX_DIR" ] && SANDBOX_DIR=$(cd "$SANDBOX_DIR" && pwd)
+    if [ ! -x "$SANDBOX_DIR/$SANDBOX_WRAPPER" ]; then
+        echo "ERROR: $SANDBOX_WRAPPER not found. Pass --sandbox-dir=PATH (the scripts/ directory of"
+        echo "       https://github.com/JaneliaScientificComputingSystems/agentic-sandbox) or set AGENTIC_SANDBOX_DIR."
+        exit 1
+    fi
+    VENV_ABS=""
+    if [ -n "$VENV_PATH" ]; then
+        if [ "$SANDBOX" = podman ]; then
+            echo "ERROR: --sandbox=podman runs the image's own Python and Ray; a host venv does not work inside it."
+            echo "       Drop --venv, or choose an image that has what the script needs (--image=...)."
+            exit 1
+        fi
+        VENV_ABS=$(cd "$(expand_tilde "$VENV_PATH")" 2>/dev/null && pwd) || { echo "ERROR: --venv $VENV_PATH: no such directory"; exit 1; }
+    fi
+    SUBMIT_DIR=$(pwd -P)
+    OUT_ABS=$(cd ../output && pwd -P)
+    SCRIPT_ABS=$(cd "$(dirname "$PYTHON_SCRIPT")" && pwd -P)/$(basename "$PYTHON_SCRIPT")
+    # Canonical (no ".."): the path is compared with the mounts below and used inside the sandbox.
+    [ -f "$NCCL_ENV_FILE" ] && NCCL_ENV_FILE=$(cd "$(dirname "$NCCL_ENV_FILE")" && pwd -P)/$(basename "$NCCL_ENV_FILE")
+
+    # Mounts. Bubblewrap binds the submission directory read-write by itself; podman mounts only
+    # what it is told. A path already inside a read-write mount is not added again. The --rw
+    # directories are created on every node first (node-local /scratch paths do not exist yet).
+    SB_MOUNTS=(); SB_RW=(); SB_MKDIR=()
+    sb_covered() { local q; for q in ${SB_RW[@]+"${SB_RW[@]}"}; do [ "$1" = "$q" ] || [ "${1#"$q"/}" != "$1" ] && return 0; done; return 1; }
+    sb_add() {  # sb_add ro|rw PATH
+        sb_covered "$2" && return 0
+        SB_MOUNTS+=("--$1" "$2"); [ "$1" = rw ] && SB_RW+=("$2")
+        return 0
+    }
+    if [ "$SANDBOX" = podman ]; then sb_add rw "$SUBMIT_DIR"; else SB_RW+=("$SUBMIT_DIR"); fi
+    sb_add rw "$OUT_ABS"
+    for d in ${SANDBOX_RW[@]+"${SANDBOX_RW[@]}"}; do
+        case "$d" in /*) ;; *) echo "ERROR: --rw=$d: give an absolute path"; exit 1 ;; esac
+        SB_MKDIR+=("$d"); sb_add rw "$d"
+    done
+    sb_add ro "$(dirname "$SCRIPT_ABS")"
+    [ -n "$VENV_ABS" ] && sb_add ro "$VENV_ABS"
+    [ "$NETWORK_BACKEND" = "IB" ] && [ -f "$NCCL_ENV_FILE" ] && sb_add ro "$(dirname "$NCCL_ENV_FILE")"
+    for d in ${SANDBOX_RO[@]+"${SANDBOX_RO[@]}"}; do
+        d=$(cd "$d" 2>/dev/null && pwd -P) || { echo "ERROR: --ro: no such directory"; exit 1; }
+        sb_add ro "$d"
+    done
+    SB_EXTRA=()
+    PREPULL_IMAGE=""
+    if [ "$SANDBOX" = podman ]; then
+        # Ray keeps its object store in /dev/shm; the size is a cap, not a reservation.
+        SB_EXTRA=(--image "$SANDBOX_IMAGE" --shm-size 64g); PREPULL_IMAGE="$SANDBOX_IMAGE"
+    fi
+
+    SB_INNER="$OUT_ABS/.ray_sandbox_inner_$$.sh"
+    SB_NODE="$OUT_ABS/.ray_sandbox_node_$$.sh"
+
+    # ---- runs INSIDE the sandbox, once per node: ROLE MY_ADDR HEAD_ADDR NUM_NODES
+    {
+        echo '#!/bin/bash'
+        echo 'ROLE=$1 MYIP=$2 HEAD=$3 NODES=$4'
+        echo "export USER=$(printf '%q' "$USER") LOGNAME=$(printf '%q' "$USER") PYTHONUNBUFFERED=1 RAY_USAGE_STATS_ENABLED=0"
+        [ -n "$VENV_ABS" ] && echo "source $(printf '%q' "$VENV_ABS/bin/activate")"
+        if [ "$NETWORK_BACKEND" = "IB" ]; then
+            echo "source $(printf '%q' "$NCCL_ENV_FILE") || exit 1"
+        else
+            echo 'export NCCL_IB_DISABLE=1 NCCL_NET_GDR_LEVEL=0 NCCL_P2P_DISABLE=0 NCCL_SHM_DISABLE=0 NCCL_BUFFSIZE=8388608 NCCL_DEBUG=INFO'
+        fi
+        echo "CPUS=${CPUS_PER_NODE} GPUS=${GPUS_PER_NODE}"
+        echo "cd $(printf '%q' "$SUBMIT_DIR") || exit 1"
+        cat << 'INNER_EOF'
+h=$(hostname -s)
+PY=$(command -v python || command -v python3)
+GCS=10101
+# Every port another node connects to is fixed inside 10000-13999; ports Ray lets the system
+# pick come from the sandbox's own range, 14000-14999.
+COMMON=(--node-ip-address="$MYIP" --num-cpus="$CPUS" --num-gpus="$GPUS"
+        --node-manager-port=10102 --object-manager-port=10103
+        --dashboard-agent-grpc-port=10105 --dashboard-agent-listen-port=10106
+        --metrics-export-port=10107 --runtime-env-agent-port=10108
+        --min-worker-port=11000 --max-worker-port=13999)
+nodes_up() {
+    timeout 30 ray status --address "$HEAD:$GCS" 2>/dev/null | awk '
+        /^(Active|Healthy):/ { a = 1; next } /^[A-Za-z]/ { a = 0 }
+        a && $1 ~ /^[0-9]+$/ { n += $1 } END { print n + 0 }'
+}
+echo "[sandbox $h] role=$ROLE address=$MYIP gpus=$(nvidia-smi -L 2>/dev/null | wc -l) $(ray --version 2>&1 | tail -1)"
+if [ "$ROLE" = head ]; then
+    ray start --head --port="$GCS" --dashboard-port=10104 --temp-dir=/tmp/ray "${COMMON[@]}" \
+        || { echo "ERROR: 'ray start --head' failed on $h"; exit 1; }
+    n=0
+    for i in $(seq 1 100); do
+        n=$(nodes_up); [ "$n" -ge "$NODES" ] && break
+        echo "Waiting for nodes to join: $n/$NODES"; sleep 3
+    done
+    if [ "$n" -lt "$NODES" ]; then
+        echo "ERROR: only $n of $NODES nodes joined the Ray cluster"
+        ray status --address "$HEAD:$GCS"; ray stop >/dev/null 2>&1; exit 1
+    fi
+    echo "================================================================"
+    echo "Ray cluster ready: all $n nodes joined"
+    ray status --address "$HEAD:$GCS"
+    echo "================================================================"
+    RAY_ADDRESS="$HEAD:$GCS" "$PY" __SCRIPT_CMD__
+    rc=$?
+    echo "Script exited: $rc"
+    ray stop >/dev/null 2>&1
+    exit $rc
+else
+    joined=0
+    for i in $(seq 1 60); do
+        ray start --address="$HEAD:$GCS" "${COMMON[@]}" && { joined=1; break; }
+        echo "[sandbox $h] head not reachable yet, retrying"; sleep 5
+    done
+    [ $joined -eq 1 ] || { echo "ERROR: $h could not join the Ray head at $HEAD:$GCS"; exit 1; }
+    echo "[sandbox $h] joined the cluster"
+    # Stay for as long as this node's raylet lives: it exits when the head stops Ray.
+    while pgrep -f raylet >/dev/null; do sleep 5; done
+    echo "[sandbox $h] Ray stopped, leaving"
+fi
+INNER_EOF
+    } > "$SB_INNER"
+    python3 -c "
+import sys
+p, cmd = sys.argv[1], sys.argv[2]
+s = open(p).read()
+open(p, 'w').write(s.replace('__SCRIPT_CMD__', cmd))
+" "$SB_INNER" "$(printf '%q' "$SCRIPT_ABS") ${SCRIPT_ARGS}"
+
+    # ---- runs on each node OUTSIDE the sandbox, started by blaunch: ROLE HEAD_ADDR NUM_NODES
+    {
+        echo '#!/bin/bash'
+        echo 'ROLE=$1 HEAD=$2 NODES=$3'
+        echo "cd $(printf '%q' "$SUBMIT_DIR") || exit 1"
+        for d in ${SB_MKDIR[@]+"${SB_MKDIR[@]}"}; do echo "mkdir -p $(printf '%q' "$d")"; done
+        echo 'NET=(); MYIP=127.0.0.1'
+        echo 'if [ "$NODES" -gt 1 ]; then'
+        echo "    MYIP=\$(getent ahostsv4 \"\$(hostname)\" | awk 'NR==1{print \$1}')"
+        if [ "$NETWORK_BACKEND" = "IB" ]; then
+            echo '    NET=(--ib --job-nodes)'
+            echo 'else'
+            echo '    NET=(--ib)'
+        else
+            echo '    NET=(--host-net)'
+        fi
+        echo 'fi'
+        printf 'exec %q --gpu "${NET[@]}"' "$SANDBOX_DIR/$SANDBOX_WRAPPER"
+        for a in ${SB_EXTRA[@]+"${SB_EXTRA[@]}"} ${SB_MOUNTS[@]+"${SB_MOUNTS[@]}"}; do printf ' %q' "$a"; done
+        printf ' -- %q "$ROLE" "$MYIP" "$HEAD" "$NODES"\n' "$SB_INNER"
+    } > "$SB_NODE"
+    chmod +x "$SB_INNER" "$SB_NODE"
+
+    SB_RO_LIST=""; for ((k = 0; k < ${#SB_MOUNTS[@]}; k += 2)); do [ "${SB_MOUNTS[k]}" = --ro ] && SB_RO_LIST+=" ${SB_MOUNTS[k+1]}"; done
+    echo "Sandbox:         $SANDBOX ($SANDBOX_DIR/$SANDBOX_WRAPPER)"
+    if [ "$NUM_NODES" -eq 1 ]; then echo "Sandbox net:     none (one node)"
+    elif [ "$NETWORK_BACKEND" = IB ]; then echo "Sandbox net:     the job's own nodes only, data over InfiniBand"
+    else echo "Sandbox net:     the node's own network (Ethernet queue)"; fi
+    echo "Sandbox write:   ${SB_RW[*]}"
+    echo "Sandbox read:   ${SB_RO_LIST:- (nothing else)}"
+    echo "================================================================"
+
+    cat << EOF | bsub
+#!/bin/bash
+#BSUB -J ${JOB_NAME}_${NUM_NODES}nodes
+#BSUB -n ${TOTAL_CPUS}
+${APP_LINE}
+#BSUB -q ${QUEUE_NAME}
+#BSUB -gpu "num=${GPUS_PER_NODE}:mode=exclusive_process"
+${SPAN_LINE}
+#BSUB -o ../output/${JOB_NAME}_%J.out
+#BSUB -e ../output/${JOB_NAME}_%J.err
+#BSUB -W ${WALLTIME}
+
+hosts=()
+for host in \$(cat \$LSB_DJOB_HOSTFILE | uniq); do hosts+=(\$host); done
+NODES=\${#hosts[@]}
+head_node=\${hosts[0]}
+HEAD_ADDR=127.0.0.1
+[ \$NODES -gt 1 ] && HEAD_ADDR=\$(getent ahostsv4 \$head_node | awk 'NR==1{print \$1}')
+echo "Host list: \${hosts[@]}"
+echo "Nodes: \$NODES | GPUs: ${TOTAL_GPUS} | Network: ${NETWORK_BACKEND} | Sandbox: ${SANDBOX}"
+echo "Head node: \$head_node (\$HEAD_ADDR)"
+
+trap 'rm -f $(printf '%q' "$SB_INNER") $(printf '%q' "$SB_NODE")' EXIT
+trap 'echo "Job interrupted by signal"; exit 143' INT TERM USR2
+
+# --sandbox=podman: every node keeps its own image store; a node that still has to pull would
+# join minutes late. Pull everywhere first.
+if [ -n "${PREPULL_IMAGE}" ]; then
+    echo "Pulling ${PREPULL_IMAGE} on every node..."
+    for host in "\${hosts[@]}"; do
+        blaunch -z \$host podman --events-backend=none pull -q ${PREPULL_IMAGE} > /dev/null 2>&1 &
+    done
+    wait
+    echo "Image pulled: \$(date)"
+fi
+
+echo ""
+echo "================================================================"
+echo "Starting Ray, one sandbox per node..."
+echo "================================================================"
+if [ \$NODES -eq 1 ]; then
+    $(printf '%q' "$SB_NODE") head \$HEAD_ADDR 1
+    script_exit_code=\$?
+else
+    blaunch -z \$head_node $(printf '%q' "$SB_NODE") head \$HEAD_ADDR \$NODES &
+    head_pid=\$!
+    worker_pids=()
+    for host in "\${hosts[@]:1}"; do
+        blaunch -z \$host $(printf '%q' "$SB_NODE") worker \$HEAD_ADDR \$NODES &
+        worker_pids+=(\$!)
+    done
+    wait \$head_pid
+    script_exit_code=\$?
+    # The head has stopped Ray; the other sandboxes leave by themselves once their raylet is
+    # gone. Give them a minute, then end whatever is left.
+    for i in \$(seq 1 12); do
+        kill -0 "\${worker_pids[@]}" 2>/dev/null || break
+        sleep 5
+    done
+    kill "\${worker_pids[@]}" 2>/dev/null
+    wait
+fi
+echo "Ray cluster stopped"
+
+if [ \$script_exit_code -ne 0 ]; then
+    echo "================================================================"
+    echo "JOB FAILED — exit code: \$script_exit_code"
+    echo "================================================================"
+    exit \$script_exit_code
+else
+    echo "================================================================"
+    echo "JOB COMPLETED SUCCESSFULLY"
+    echo "================================================================"
+fi
+EOF
+    exit $?
+fi
 
 cat << EOF | bsub
 #!/bin/bash
