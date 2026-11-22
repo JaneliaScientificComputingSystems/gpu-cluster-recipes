@@ -78,6 +78,10 @@ tokens).
 | `--image=IMAGE` | podman only; default `agentic-sandbox-gpu` (PyTorch, NCCL, Ray, InfiniBand libraries) |
 | `--ro=PATH`, `--rw=PATH` | extra directories the worker may read / write (repeatable) |
 
+The launchers need the `multi-node` branch of agentic-sandbox (`--job-nodes`, `--ib` and
+`--host-net` are not on its `main` yet): `git clone -b multi-node` that repository and point
+`--sandbox-dir` or `$AGENTIC_SANDBOX_DIR` at its `scripts/` directory.
+
 The launcher picks the network from the queue; there is nothing to choose:
 
 | Queue | Network inside the sandbox |
@@ -88,6 +92,9 @@ The launcher picks the network from the queue; there is nothing to choose:
 
 Limits:
 
+- **"Connection reset by peer" warnings at the start are expected** on InfiniBand queues with
+  two or more nodes. PyTorch logs them, with a stack trace, when a worker starts a moment
+  before the process it connects to on the other node; it retries and the job continues.
 - `--conda` and `--modules` do not work with `--sandbox`. Use `--venv` with `bwrap`, or an image
   with `podman`. A host venv does not work inside a container.
 - With `podman` the image is pulled on every node before the workers start (about two minutes
