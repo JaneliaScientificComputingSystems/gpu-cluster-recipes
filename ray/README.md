@@ -156,16 +156,16 @@ tokens).
 Name every directory the script reads or writes outside the submission directory. The examples
 here read `/nrs/ml_datasets` and write Ray's results to `/scratch/$USER/ray_results`.
 
-The launchers need the `multi-node` branch of agentic-sandbox (`--job-nodes`, `--ib` and
-`--host-net` are not on its `main` yet): `git clone -b multi-node` that repository and point
+The launchers need the `multi-node` branch of agentic-sandbox (`--host-net` and `--ib` are
+not on its `main` yet): `git clone -b multi-node` that repository and point
 `--sandbox-dir` or `$AGENTIC_SANDBOX_DIR` at its `scripts/` directory.
 
-The launcher picks the network from the queue; there is nothing to choose:
+The launcher picks the network; there is nothing to choose:
 
-| Queue | Network inside the sandbox |
+| Job | Network inside the sandbox |
 |---|---|
-| InfiniBand (B300, H200, H100), 2+ nodes | the other nodes of this job only: no internet, no other host. NCCL's data goes over InfiniBand directly |
-| Ethernet (L4, A100, RTX 6000), 2+ nodes | the node's own network, not limited |
+| 2+ nodes | the node's own network, not limited, so that the nodes reach each other. Files, home directory, keys and tokens stay hidden as always |
+| 2+ nodes on an InfiniBand queue (B300, H200, H100) | the same, with the InfiniBand devices: NCCL's data goes over InfiniBand directly |
 | one node | none; Ray runs on the sandbox's own loopback |
 
 How it differs from a normal run:
@@ -174,17 +174,14 @@ How it differs from a normal run:
   other nodes, runs the script and stops Ray. Each other node's sandbox joins and stays until
   its raylet exits. Without `--sandbox`, Ray daemons are left on each node and the script runs
   in the job script.
-- **Ray's ports are fixed**, because a limited network lets other nodes in on one block of
-  2000 ports only (13000 to 14999 when the job has its nodes to itself). The launcher takes
-  them from the lowest 500 of the sandbox's block. Each sandbox has its own network, so the
-  fixed ports do not collide with another job on the same node.
+- **Ray's ports are fixed**, from 11000 up. A multi-node job has its nodes to itself on the
+  parallel queues, so they do not collide with another job.
 - **With `podman` the image is pulled on every node first** (about two minutes for the default
   image on a node that does not have it yet), and a host venv does not work inside it.
-- **"Connection reset by peer" warnings at the start are expected** on InfiniBand queues with
-  two or more nodes. PyTorch logs them, with a stack trace, when a worker starts a moment
-  before the process it connects to on the other node; it retries and the job continues.
-- **Tested:** CIFAR-10, 10 epochs, two H200 nodes: 71.4% with `bwrap`, 71.8% with `podman`,
-  both over InfiniBand; one node with two GPUs with `bwrap`. The Ethernet path is not run yet.
+- **Tested:** CIFAR-10, 3 epochs, with `podman`: two H200 nodes over InfiniBand (60.8%) and
+  two A100 nodes over Ethernet (69.5%). `bwrap` is not rerun since the network changed to
+  the node's own; before that, 10 epochs on two H200 nodes gave 71.4% with `bwrap` and 71.8%
+  with `podman`.
 - **One node on an InfiniBand queue:** the sandbox has no network, so the launcher drops the
   network interface that the NCCL settings name; NCCL then uses the loopback.
 

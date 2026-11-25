@@ -361,11 +361,9 @@ echo "Worker script: $WORKER_SCRIPT"
 # then sees the working directory, the output directory and what --ro/--rw name, and none of
 # the rest of your account (home directory, keys, tokens).
 #
-# The network is chosen here, by queue, never by the user:
-#   InfiniBand queues  --ib --job-nodes : TCP reaches the other nodes of this job only (no
-#                      internet, no other host); the data goes over InfiniBand at full speed
-#   Ethernet queues    --host-net       : the node's own network. NCCL's data travels over
-#                      TCP there, and the limited network is about 40 times slower
+# The network is chosen here, never by the user:
+#   two or more nodes  --host-net : the node's own network, so that the nodes reach each other.
+#                      On InfiniBand queues --ib as well: the data goes over InfiniBand
 #   one node           no network at all
 #-----------------------------------------------------------------------
 SANDBOX_PREFIX=""
@@ -426,7 +424,7 @@ if [ -n "$SANDBOX" ]; then
         echo "cd $(printf '%q' "$WORK_DIR") || exit 1"
         echo 'NET=()'
         if [ "$NETWORK_BACKEND" = "IB" ]; then
-            echo 'if [ "$3" -gt 1 ]; then NET=(--ib --job-nodes --listen "$6"); else NET=(--ib); fi'
+            echo 'if [ "$3" -gt 1 ]; then NET=(--host-net --ib); else NET=(--ib); fi'
         else
             echo 'if [ "$3" -gt 1 ]; then NET=(--host-net); fi'
         fi

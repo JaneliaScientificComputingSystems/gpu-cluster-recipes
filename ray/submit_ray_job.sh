@@ -264,16 +264,12 @@ mkdir -p ../output
 #   head node     one sandbox: ray start --head, wait for the nodes, run the script, ray stop
 #   other nodes   one sandbox each: ray start --address, then stay until the raylet exits
 #
-# The network is chosen here, by queue, never by the user:
-#   InfiniBand queues  --ib --job-nodes : TCP reaches the other nodes of this job only; NCCL's
-#                      data goes over InfiniBand at full speed
-#   Ethernet queues    --host-net       : the node's own network (the limited one is too slow
-#                      when NCCL's data travels over TCP)
+# The network is chosen here, never by the user:
+#   two or more nodes  --host-net : the node's own network, so that the nodes reach each other.
+#                      On InfiniBand queues --ib as well: NCCL's data goes over InfiniBand
 #   one node           no network: Ray runs on the sandbox's own loopback
-# With a limited network other nodes reach a sandbox on one block of 2000 ports only (13000-14999
-# when the node is the job's own), so every Ray port is fixed inside the sandbox's block; each
-# sandbox has its own network namespace (or, on Ethernet parallel queues, a whole node), so
-# fixed ports cannot collide with another job.
+# Every Ray port is fixed. A multi-node job has its nodes to itself on the parallel queues, and
+# a one-node sandbox has its own network namespace, so the ports cannot collide with another job.
 #===============================================================================
 if [ -n "$SANDBOX" ]; then
     case "$SANDBOX" in
@@ -357,14 +353,11 @@ if [ -n "$SANDBOX" ]; then
         cat << 'INNER_EOF'
 h=$(hostname -s)
 PY=$(command -v python || command -v python3)
-# Every port another node connects to is fixed. In a sandbox with a limited network they must
-# lie in its block of 2000 ports: the sandbox's own range for ports the system picks is the
-# top 1500 of the block, so the fixed ones go in the 500 below that. Elsewhere (the node's
-# own network, or one node) they start at 10000.
-read -r elo ehi < /proc/sys/net/ipv4/ip_local_port_range
-if [ $((ehi - elo)) -eq 1499 ]; then B=$((elo - 500)); else B=10000; fi
+# Every port another node connects to is fixed, from 11000 up: below the range the system
+# picks its own ports from, and clear of Ray's own default for its client server (10001).
+B=11000
 GCS=$((B + 1))
-# The head's block can differ from this node's when the nodes are shared: the head says which.
+# The head writes its port here once Ray is up; the other nodes wait for the file.
 GCS_FILE=.ray_gcs_$JOB
 COMMON=(--node-ip-address="$MYIP" --num-cpus="$CPUS" --num-gpus="$GPUS"
         --node-manager-port=$((B + 2)) --object-manager-port=$((B + 3))
@@ -433,7 +426,7 @@ open(p, 'w').write(s.replace('__SCRIPT_CMD__', cmd))
         echo 'if [ "$NODES" -gt 1 ]; then'
         echo "    MYIP=\$(getent ahostsv4 \"\$(hostname)\" | awk 'NR==1{print \$1}')"
         if [ "$NETWORK_BACKEND" = "IB" ]; then
-            echo '    NET=(--ib --job-nodes)'
+            echo '    NET=(--host-net --ib)'
             echo 'else'
             echo '    NET=(--ib)'
         else
