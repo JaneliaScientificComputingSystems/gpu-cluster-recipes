@@ -62,6 +62,14 @@ usage() {
     echo "  --workdir=PATH       Working directory (default: script's directory)"
     echo "  --output-dir=PATH    Output log directory (default: ../output)"
     echo "  --host=\"H1 H2 ...\"   Pin job to specific hosts (#BSUB -m); useful for node isolation"
+    echo "  --sandbox=KIND       Run each node's worker in a sandbox: bwrap or podman (agentic-sandbox)."
+    echo "                       The network is chosen by queue: InfiniBand queues reach the job's own"
+    echo "                       nodes only; Ethernet queues keep the node's network."
+    echo "  --sandbox-dir=PATH   Where sandbox-run.sh / podman-run.sh live (default: \$AGENTIC_SANDBOX_DIR,"
+    echo "                       else wherever they are found on PATH)"
+    echo "  --image=IMAGE        Container image for --sandbox=podman (default: agentic-sandbox-gpu)"
+    echo "  --ro=PATH, --rw=PATH Extra directory the sandboxed worker may read / write (repeatable);"
+    echo "                       datasets and checkpoints outside the working directory"
     echo ""
     echo "Script arguments: use '--' separator"
     echo "  Example: $0 2 --script=train.py -- --epochs=50 --batch-size=128"
@@ -87,6 +95,11 @@ SCRIPT_ARGS_Q=""
 USER_NUM_GPUS=""
 USER_NUM_CPUS=""
 HOST_SELECT=""
+SANDBOX=""
+SANDBOX_DIR="${AGENTIC_SANDBOX_DIR:-}"
+SANDBOX_IMAGE="ghcr.io/janeliascientificcomputingsystems/agentic-sandbox-gpu:latest"
+SANDBOX_RO=()
+SANDBOX_RW=()
 
 # bash does not expand "~" inside --opt=~/path, so do it for path options
 expand_tilde() {
@@ -111,6 +124,11 @@ while [[ $# -gt 0 ]]; do
         --workdir=*)    WORK_DIR="$(expand_tilde "${1#*=}")"; shift ;;
         --output-dir=*) OUTPUT_DIR="$(expand_tilde "${1#*=}")"; shift ;;
         --host=*)       HOST_SELECT="${1#*=}"; shift ;;
+        --sandbox=*)    SANDBOX="${1#*=}"; shift ;;
+        --sandbox-dir=*) SANDBOX_DIR="$(expand_tilde "${1#*=}")"; shift ;;
+        --image=*)      SANDBOX_IMAGE="${1#*=}"; shift ;;
+        --ro=*)         SANDBOX_RO+=("$(expand_tilde "${1#*=}")"); shift ;;
+        --rw=*)         SANDBOX_RW+=("$(expand_tilde "${1#*=}")"); shift ;;
         --) shift; SCRIPT_ARGS="$*"
             # shell-quoted copy, so args with spaces/quotes/\$ reach the script intact
             [ $# -gt 0 ] && SCRIPT_ARGS_Q=$(printf '%q ' "$@")
@@ -308,6 +326,9 @@ ENV_BLOCK="${ENV_BLOCK}"'export PYTHONPATH="${PYTHONPATH}:'"${WORK_DIR}"'"'$'\n'
 # NCCL configuration
 if [ "$NETWORK_BACKEND" = "IB" ] && [ -f "$NCCL_ENV_FILE" ]; then
     ENV_BLOCK="${ENV_BLOCK}source $(printf '%q' "${NCCL_ENV_FILE}")"$'\n'
+    # --sandbox on one node: the sandbox has no network, only its own loopback, and the
+    # interface the settings name does not exist in it. NCCL then finds the loopback by itself.
+    [ -n "$SANDBOX" ] && [ "$NUM_NODES" -eq 1 ] && ENV_BLOCK="${ENV_BLOCK}unset NCCL_SOCKET_IFNAME"$'\n'
 else
     ENV_BLOCK="${ENV_BLOCK}export NCCL_IB_DISABLE=1"$'\n'
     ENV_BLOCK="${ENV_BLOCK}export NCCL_NET_GDR_LEVEL=0"$'\n'
@@ -332,6 +353,93 @@ with open(sys.argv[1], 'w') as f:
 chmod +x "$WORKER_SCRIPT"
 
 echo "Worker script: $WORKER_SCRIPT"
+
+#-----------------------------------------------------------------------
+# --sandbox: a second small script that blaunch starts on each node INSTEAD of the worker
+# script. It starts the worker inside an agentic-sandbox sandbox (sandbox-run.sh = Bubblewrap,
+# podman-run.sh = a container), one per node; this launcher itself stays outside. The worker
+# then sees the working directory, the output directory and what --ro/--rw name, and none of
+# the rest of your account (home directory, keys, tokens).
+#
+# The network is chosen here, never by the user:
+#   two or more nodes  --host-net : the node's own network, so that the nodes reach each other.
+#                      On InfiniBand queues --ib as well: the data goes over InfiniBand
+#   one node           no network at all
+#-----------------------------------------------------------------------
+SANDBOX_PREFIX=""
+SANDBOX_SCRIPT=""
+PREPULL_IMAGE=""
+if [ -n "$SANDBOX" ]; then
+    case "$SANDBOX" in
+        bwrap)  SANDBOX_WRAPPER="sandbox-run.sh" ;;
+        podman) SANDBOX_WRAPPER="podman-run.sh" ;;
+        *) echo "ERROR: --sandbox takes bwrap or podman (got '$SANDBOX')"; rm -f "$WORKER_SCRIPT"; exit 1 ;;
+    esac
+    if [ -z "$SANDBOX_DIR" ]; then
+        found=$(command -v "$SANDBOX_WRAPPER" 2>/dev/null) && SANDBOX_DIR=$(dirname "$(readlink -f "$found")")
+    fi
+    [ -d "$SANDBOX_DIR" ] && SANDBOX_DIR=$(cd "$SANDBOX_DIR" && pwd)   # absolute: the worker starts elsewhere
+    if [ ! -x "$SANDBOX_DIR/$SANDBOX_WRAPPER" ]; then
+        echo "ERROR: $SANDBOX_WRAPPER not found. Pass --sandbox-dir=PATH (the scripts/ directory of"
+        echo "       https://github.com/JaneliaScientificComputingSystems/agentic-sandbox) or set AGENTIC_SANDBOX_DIR."
+        rm -f "$WORKER_SCRIPT"; exit 1
+    fi
+    if [ -n "$CONDA_ENV" ] || [ -n "$MODULES" ]; then
+        echo "ERROR: --sandbox does not support --conda or --modules. Use --venv (bwrap) or an image (podman)."
+        rm -f "$WORKER_SCRIPT"; exit 1
+    fi
+    if [ "$SANDBOX" = podman ] && [ -n "$VENV_PATH" ]; then
+        echo "ERROR: --sandbox=podman runs the image's own Python; a host venv does not work inside it."
+        echo "       Drop --venv, or choose an image that has what the script needs (--image=...)."
+        rm -f "$WORKER_SCRIPT"; exit 1
+    fi
+
+    # Mounts. Bubblewrap binds the working directory read-write by itself; podman mounts only
+    # what it is told. A path that is already inside a read-write mount is not added again.
+    SB_MOUNTS=()
+    SB_RW=()
+    sb_covered() { local q; for q in ${SB_RW[@]+"${SB_RW[@]}"}; do [ "$1" = "$q" ] || [ "${1#"$q"/}" != "$1" ] && return 0; done; return 1; }
+    sb_add() {  # sb_add ro|rw PATH
+        local m=$1 d
+        d=$(cd "$2" 2>/dev/null && pwd -P) || { echo "ERROR: --$m $2: no such directory"; rm -f "$WORKER_SCRIPT"; exit 1; }
+        sb_covered "$d" && return 0
+        SB_MOUNTS+=("--$m" "$d"); [ "$m" = rw ] && SB_RW+=("$d")
+        return 0
+    }
+    if [ "$SANDBOX" = podman ]; then sb_add rw "$WORK_DIR"; else SB_RW+=("$(cd "$WORK_DIR" && pwd -P)"); fi
+    sb_add rw "$OUTPUT_DIR"
+    for d in ${SANDBOX_RW[@]+"${SANDBOX_RW[@]}"}; do sb_add rw "$d"; done
+    sb_add ro "$(dirname "$PYTHON_SCRIPT")"
+    [ -n "$VENV_PATH" ] && sb_add ro "$VENV_PATH"
+    [ "$NETWORK_BACKEND" = "IB" ] && [ -f "$NCCL_ENV_FILE" ] && sb_add ro "$(dirname "$NCCL_ENV_FILE")"
+    for d in ${SANDBOX_RO[@]+"${SANDBOX_RO[@]}"}; do sb_add ro "$d"; done
+
+    SB_IMAGE_ARGS=()
+    if [ "$SANDBOX" = podman ]; then SB_IMAGE_ARGS=(--image "$SANDBOX_IMAGE"); PREPULL_IMAGE="$SANDBOX_IMAGE"; fi
+
+    SANDBOX_SCRIPT="${OUTPUT_DIR}/.torchrun_sandbox_$$.sh"
+    {
+        echo '#!/bin/bash'
+        echo '# Started by blaunch on each node: WORKER_SCRIPT NODE_RANK NUM_NODES GPUS MASTER_ADDR MASTER_PORT'
+        echo "cd $(printf '%q' "$WORK_DIR") || exit 1"
+        echo 'NET=()'
+        if [ "$NETWORK_BACKEND" = "IB" ]; then
+            echo 'if [ "$3" -gt 1 ]; then NET=(--host-net --ib); else NET=(--ib); fi'
+        else
+            echo 'if [ "$3" -gt 1 ]; then NET=(--host-net); fi'
+        fi
+        printf 'exec %q --gpu "${NET[@]}"' "$SANDBOX_DIR/$SANDBOX_WRAPPER"
+        for a in ${SB_IMAGE_ARGS[@]+"${SB_IMAGE_ARGS[@]}"} ${SB_MOUNTS[@]+"${SB_MOUNTS[@]}"}; do printf ' %q' "$a"; done
+        echo ' -- "$@"'
+    } > "$SANDBOX_SCRIPT"
+    chmod +x "$SANDBOX_SCRIPT"
+    SANDBOX_PREFIX="$(printf '%q' "$SANDBOX_SCRIPT") "
+    echo "Sandbox:       $SANDBOX ($SANDBOX_DIR/$SANDBOX_WRAPPER)"
+    echo "Sandbox net:   $([ "$NETWORK_BACKEND" = IB ] && echo "the job's own nodes only, data over InfiniBand" || echo "the node's own network (Ethernet queue)")"
+    SB_RO_LIST=""; for ((k = 0; k < ${#SB_MOUNTS[@]}; k += 2)); do [ "${SB_MOUNTS[k]}" = --ro ] && SB_RO_LIST+=" ${SB_MOUNTS[k+1]}"; done
+    echo "Sandbox write: ${SB_RW[*]}"
+    echo "Sandbox read:  ${SB_RO_LIST:- (nothing else)}"
+fi
 
 #-----------------------------------------------------------------------
 # Build BSUB directives
@@ -418,6 +526,18 @@ if [ "${NETWORK_BACKEND}" = "IB" ]; then
     fi
 fi
 
+# --sandbox=podman: every node keeps its own image store, and a node that still has to pull
+# (minutes, for a PyTorch image) starts its worker too late for the others. Pull everywhere first.
+if [ -n "${PREPULL_IMAGE}" ]; then
+    echo ""
+    echo "Pulling ${PREPULL_IMAGE} on every node..."
+    for host in "\${hosts[@]}"; do
+        blaunch -z \$host podman --events-backend=none pull -q ${PREPULL_IMAGE} > /dev/null 2>&1 &
+    done
+    wait
+    echo "Image pulled: \$(date)"
+fi
+
 echo ""
 echo "================================================================"
 echo "Launching torchrun..."
@@ -428,7 +548,7 @@ echo "================================================================"
 #-----------------------------------------------------------------------
 if [ \$NUM_NODES -eq 1 ]; then
     # Single-node: run worker script directly (node_rank=0)
-    ${WORKER_SCRIPT_Q} 0 1 \$GPUS_PER_NODE 127.0.0.1 \$MASTER_PORT
+    ${SANDBOX_PREFIX}${WORKER_SCRIPT_Q} 0 1 \$GPUS_PER_NODE 127.0.0.1 \$MASTER_PORT
     EXIT_CODE=\$?
 else
     # Multi-node: blaunch worker script on each node
@@ -437,7 +557,7 @@ else
         host=\${hosts[\$i]}
         echo "  Node \$i: \$host"
 
-        blaunch -z \$host ${WORKER_SCRIPT_Q} \$i \$NUM_NODES \$GPUS_PER_NODE \$MASTER_ADDR \$MASTER_PORT &
+        blaunch -z \$host ${SANDBOX_PREFIX}${WORKER_SCRIPT_Q} \$i \$NUM_NODES \$GPUS_PER_NODE \$MASTER_ADDR \$MASTER_PORT &
         PIDS+=(\$!)
     done
 
@@ -453,7 +573,7 @@ else
 fi
 
 # Cleanup worker script
-rm -f ${WORKER_SCRIPT_Q}
+rm -f ${WORKER_SCRIPT_Q} $([ -n "$SANDBOX_SCRIPT" ] && printf '%q' "$SANDBOX_SCRIPT")
 
 echo ""
 echo "================================================================"

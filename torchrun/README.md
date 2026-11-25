@@ -53,6 +53,56 @@ environment and code:
 
 ---
 
+### Running the workers in a sandbox (`--sandbox`)
+
+`--sandbox=bwrap` or `--sandbox=podman` starts each node's worker inside a sandbox from
+[agentic-sandbox](https://github.com/JaneliaScientificComputingSystems/agentic-sandbox), one per
+node. The launcher itself stays outside. Use it for training code you did not write yourself,
+such as code an AI agent wrote: the worker sees the working directory, the output directory and
+what you name with `--ro`/`--rw`, and nothing else of your account (no home directory, keys or
+tokens).
+
+```bash
+# Bubblewrap, with your venv
+./submit_torchrun_job.sh 2 --queue=gpu_h200_parallel --script=train.py --venv=~/torch_env \
+    --sandbox=bwrap --ro=/nrs/ml_datasets
+
+# podman, with the image's own PyTorch (no --venv)
+./submit_torchrun_job.sh 2 --queue=gpu_h200_parallel --script=train.py --sandbox=podman
+```
+
+| Option | Meaning |
+|---|---|
+| `--sandbox=bwrap\|podman` | which sandbox |
+| `--sandbox-dir=PATH` | where `sandbox-run.sh` / `podman-run.sh` live; default `$AGENTIC_SANDBOX_DIR`, else `PATH` |
+| `--image=IMAGE` | podman only; default `agentic-sandbox-gpu` (PyTorch, NCCL, Ray, InfiniBand libraries) |
+| `--ro=PATH`, `--rw=PATH` | extra directories the worker may read / write (repeatable) |
+
+The launchers need agentic-sandbox from 25 November 2026 or later (`--host-net` and `--ib`):
+clone that repository, or `git pull` an older checkout, and point `--sandbox-dir` or
+`$AGENTIC_SANDBOX_DIR` at its `scripts/` directory.
+
+The launcher picks the network; there is nothing to choose:
+
+| Job | Network inside the sandbox |
+|---|---|
+| 2+ nodes | the node's own network, not limited, so that the nodes reach each other. Files, home directory, keys and tokens stay hidden as always |
+| 2+ nodes on an InfiniBand queue (B300, H200, H100) | the same, with the InfiniBand devices: NCCL's data goes over InfiniBand directly |
+| one node | none |
+
+Limits:
+
+- `--conda` and `--modules` do not work with `--sandbox`. Use `--venv` with `bwrap`, or an image
+  with `podman`. A host venv does not work inside a container.
+- With `podman` the image is pulled on every node before the workers start (about two minutes
+  for the default image on a node that does not have it yet).
+- Measured on two H200 nodes with `test_torchrun_ibstress.py`: 481 GB/s sustained with either
+  sandbox, against 482 without.
+- Also run: two L4 nodes over Ethernet, 6.5 GB/s with `bwrap` and 6.3 GB/s with `podman`; one
+  node with two GPUs with `bwrap`.
+- The cluster accepts a multi-node GPU job only on a `*_parallel` queue and only with whole
+  nodes, which is what this launcher asks for. Each sandbox therefore has its node to itself.
+
 ## Example: ViT on ImageNet-1K (`vit_imagenet_torchrun.py`)
 
 Trains a Vision Transformer on ImageNet-1K with plain `torchrun` + DDP.
