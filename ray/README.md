@@ -156,9 +156,9 @@ tokens).
 Name every directory the script reads or writes outside the submission directory. The examples
 here read `/nrs/ml_datasets` and write Ray's results to `/scratch/$USER/ray_results`.
 
-The launchers need the `multi-node` branch of agentic-sandbox (`--host-net` and `--ib` are
-not on its `main` yet): `git clone -b multi-node` that repository and point
-`--sandbox-dir` or `$AGENTIC_SANDBOX_DIR` at its `scripts/` directory.
+The launchers need agentic-sandbox from 25 November 2026 or later (`--host-net` and `--ib`):
+clone that repository, or `git pull` an older checkout, and point `--sandbox-dir` or
+`$AGENTIC_SANDBOX_DIR` at its `scripts/` directory.
 
 The launcher picks the network; there is nothing to choose:
 
