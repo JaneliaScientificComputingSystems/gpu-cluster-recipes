@@ -178,10 +178,9 @@ How it differs from a normal run:
   parallel queues, so they do not collide with another job.
 - **With `podman` the image is pulled on every node first** (about two minutes for the default
   image on a node that does not have it yet), and a host venv does not work inside it.
-- **Tested:** CIFAR-10, 3 epochs, with `podman`: two H200 nodes over InfiniBand (60.8%) and
-  two A100 nodes over Ethernet (69.5%). `bwrap` is not rerun since the network changed to
-  the node's own; before that, 10 epochs on two H200 nodes gave 71.4% with `bwrap` and 71.8%
-  with `podman`.
+- **Tested:** CIFAR-10, 3 epochs, on two H200 nodes over InfiniBand (60.8% with `podman`,
+  62.3% with `bwrap`) and on two A100 nodes over Ethernet (69.5% with `podman`, 68.9% with
+  `bwrap`).
 - **One node on an InfiniBand queue:** the sandbox has no network, so the launcher drops the
   network interface that the NCCL settings name; NCCL then uses the loopback.
 
