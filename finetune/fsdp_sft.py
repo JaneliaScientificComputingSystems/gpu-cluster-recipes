@@ -11,8 +11,7 @@ hold (with optimizer state) on a single GPU — a 72B model needs ~1.1 TB of sta
 so ~2 nodes of 8x80GB GPUs at minimum.
 
 Dense on purpose: FSDP full-shard composes cleanly with a dense model. A large
-MoE would additionally need expert parallelism (all-to-all) — see
-DENSE_VS_MOE_FINETUNING.md.
+MoE would additionally need expert parallelism (all-to-all).
 
 Launch with the multi-node torchrun launcher, which sets RANK/WORLD_SIZE/LOCAL_RANK
 (HuggingFace Trainer reads them automatically) — see the README:

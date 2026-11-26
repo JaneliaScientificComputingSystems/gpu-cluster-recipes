@@ -53,91 +53,22 @@ environment and code:
 
 ---
 
-### Running the workers in a sandbox (`--sandbox`)
-
-`--sandbox=bwrap` or `--sandbox=podman` starts each node's worker inside a sandbox from
-[agentic-sandbox](https://github.com/JaneliaScientificComputingSystems/agentic-sandbox), one per
-node. The launcher itself stays outside. Use it for training code you did not write yourself,
-such as code an AI agent wrote: the worker sees the working directory, the output directory and
-what you name with `--ro`/`--rw`, and nothing else of your account (no home directory, keys or
-tokens).
-
-```bash
-# Bubblewrap, with your venv
-./submit_torchrun_job.sh 2 --queue=gpu_h200_parallel --script=train.py --venv=~/torch_env \
-    --sandbox=bwrap --ro=/nrs/ml_datasets
-
-# podman, with the image's own PyTorch (no --venv)
-./submit_torchrun_job.sh 2 --queue=gpu_h200_parallel --script=train.py --sandbox=podman
-```
-
-| Option | Meaning |
-|---|---|
-| `--sandbox=bwrap\|podman` | which sandbox |
-| `--sandbox-dir=PATH` | where `sandbox-run.sh` / `podman-run.sh` live; default `$AGENTIC_SANDBOX_DIR`, else `PATH` |
-| `--image=IMAGE` | podman only; default `agentic-sandbox-gpu` (PyTorch, NCCL, Ray, InfiniBand libraries) |
-| `--ro=PATH`, `--rw=PATH` | extra directories the worker may read / write (repeatable) |
-
-The launchers need agentic-sandbox from 25 November 2026 or later (`--host-net` and `--ib`):
-clone that repository, or `git pull` an older checkout, and point `--sandbox-dir` or
-`$AGENTIC_SANDBOX_DIR` at its `scripts/` directory.
-
-The launcher picks the network; there is nothing to choose:
-
-| Job | Network inside the sandbox |
-|---|---|
-| 2+ nodes | the node's own network, not limited, so that the nodes reach each other. Files, home directory, keys and tokens stay hidden as always |
-| 2+ nodes on an InfiniBand queue (B300, H200, H100) | the same, with the InfiniBand devices: NCCL's data goes over InfiniBand directly |
-| one node | none (on an InfiniBand queue the InfiniBand devices are still there) |
-
-Limits:
-
-- `--conda` and `--modules` do not work with `--sandbox`. Use `--venv` with `bwrap`, or an image
-  with `podman`. A host venv does not work inside a container.
-- With `podman` the image is pulled on every node before the workers start (about two minutes
-  for the default image on a node that does not have it yet).
-- Measured on two H200 nodes with `test_torchrun_ibstress.py`: 481 GB/s sustained with either
-  sandbox, against 482 without.
-- Also run: two L4 nodes over Ethernet, 6.5 GB/s with `bwrap` and 6.3 GB/s with `podman`; one
-  node with two GPUs with `bwrap`.
-- The cluster accepts a multi-node GPU job only on a `*_parallel` queue and only with whole
-  nodes, which is what this launcher asks for. Each sandbox therefore has its node to itself.
+**In a sandbox:** add `--sandbox=bwrap` or `--sandbox=podman` to run code you did not write
+yourself (such as code an AI agent wrote) where it cannot see your home directory, keys or
+tokens. See [Running the workers in a sandbox](#running-the-workers-in-a-sandbox---sandbox).
 
 ## Example: ViT on ImageNet-1K (`vit_imagenet_torchrun.py`)
-
-Trains a Vision Transformer on ImageNet-1K with plain `torchrun` + DDP.
-
-### What it does
 
 Trains a Vision Transformer on ImageNet-1K with DDP + AdamW, bf16 mixed precision on H100/H200,
 LR scaled by effective batch size with linear warmup + cosine decay, gradient clipping 1.0.
 Sizes via `--model-size`: `base` (86M), `large` (307M), `huge` (632M).
 
-### What it produces
+With `--save-models`, checkpoints go to `../models/` as plain PyTorch `state_dict`s.
 
-- Per-epoch top-1 accuracy, loss, and images/sec throughput (to stderr)
-- Checkpoints (`.pth`) saved to `../models/` with `--save-models`
-- Checkpoints are plain PyTorch `state_dict`s — load them with any PyTorch inference script
-
-### Data
-
-ImageNet-1K, pre-installed at `/nrs/ml_datasets/imagenet` (shared NFS, ~138 GB) — no setup needed.
-
-**Data-loading design:** each rank loads only its own ~1/N slice of the parquet shards into a
-compact Arrow table and decodes rows lazily, so no process materializes the whole dataset. (An
-earlier version eagerly `to_pylist()`-ed all ~1.2M images on *every* rank; rank 0 never reached
-`DDP()` before the 600 s NCCL rendezvous timeout, and the job died with a c10d store timeout.) Train
-shards are partitioned across ranks — standard DDP data parallelism — while validation keeps the
-full shard set with a `DistributedSampler` for a correct all-reduced accuracy. Because ranks can hold
-slightly different shard counts, each epoch is capped to the global-minimum batch count so the
-gradient all-reduce stays in lock-step.
+Data: `/nrs/ml_datasets/imagenet` (`--data-dir` to change). Each rank loads only its own slice of
+the parquet shards and decodes rows lazily, so no process holds the whole dataset.
 
 ### Train
-
-> ✅ Validated 2026-08-08 (2 nodes / 16×H100): dataset loads in ~19 s, reaches DDP init, trains at
-> ~6–9k img/s over InfiniBand, and runs validation to a clean exit (both workers exit 0).
-
-
 
 ```bash
 # ViT-base, 2 nodes / 16 GPUs — validation run (run from this torchrun/ directory)
@@ -161,7 +92,7 @@ directory, so `--script=<file>` is relative):
 
 | Script | Purpose |
 |---|---|
-| `test_torchrun.py` | Minimal NCCL sanity check — all-reduce/all-gather across every rank; fast (~30 s once running). |
+| `test_torchrun.py` | Minimal NCCL sanity check — all-reduce/all-gather across every rank; fast. |
 | `test_torchrun_soak.py` | Sustained small-message all-reduce over minutes — catches intermittent mid-run cross-node stalls the minimal test misses. Env tunables: `SOAK_ITERS`, `SOAK_NUMEL`, `SOAK_SLEEP`. |
 | `test_torchrun_ibstress.py` | Bandwidth stress — message-size sweep + sustained large-message all-reduce, reports algbw/busbw (GB/s) like `nccl-tests`. Args: `--sweep-min-mb`, `--max-mb`, `--secs`, `--dtype`. |
 
@@ -176,9 +107,6 @@ directory, so `--script=<file>` is relative):
 ./submit_torchrun_job.sh 2 --queue=gpu_h200_parallel --venv=~/torch_env --script=test_torchrun.py
 ```
 Success prints `[PASS] ... all ranks` and, on IB, `NET/IB/*/GDRDMA` in the NCCL debug output.
-
-> ✅ Validated 2026-08-08: `test_torchrun.py` passes across all ranks (a 2-node/16-GPU run measured
-> ~574 GB/s on the sanity all-reduce).
 
 ### Pitfall: a long solo phase on rank 0
 
@@ -205,10 +133,6 @@ dist.monitored_barrier(group=gloo_group, timeout=timedelta(seconds=7200), wait_a
 - **Or** raise the watchdog above the longest solo phase: `export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=7200`
   before submitting.
 
-This repo used to ship `test_gloo_barrier.py`, a reproduction of the abort and of the fix. It was
-removed on 2026-11-19: it held two whole nodes idle for minutes per run and depended on watchdog
-behaviour that changes between PyTorch versions. The last version is in the git history.
-
 ### Bandwidth stress (busbw)
 
 ```bash
@@ -218,6 +142,80 @@ behaviour that changes between PyTorch versions. The last version is in the git 
     --script=test_torchrun_ibstress.py -- --sweep-min-mb 8 --max-mb 4096 --secs 600
 ```
 
-**Validated (2026-08-08, 32×B300):** busbw plateaus **~740 GB/s** (≈92% of the 8×XDR 800 Gb/s
-per-node line rate; ~96 Tb/s aggregate across 128 rails) and holds flat over a 10-min sustained
-hammer with zero errors. The soak test likewise ran 2000 cross-node all-reduces with no hang.
+---
+
+## Running the workers in a sandbox (`--sandbox`)
+
+`--sandbox=bwrap` or `--sandbox=podman` starts each node's worker inside a sandbox from
+[agentic-sandbox](https://github.com/JaneliaScientificComputingSystems/agentic-sandbox), one per
+node. The launcher itself stays outside. Use it for training code you did not write yourself,
+such as code an AI agent wrote. Everything else in this README works the same without it.
+
+### Before you start
+
+1. Clone agentic-sandbox (25 November 2026 or later; `git pull` an older checkout) and point the
+   launcher at its `scripts/` directory:
+
+   ```bash
+   git clone https://github.com/JaneliaScientificComputingSystems/agentic-sandbox.git ~/agentic-sandbox
+   export AGENTIC_SANDBOX_DIR=~/agentic-sandbox/scripts      # or pass --sandbox-dir=...
+   ```
+
+2. `--sandbox=bwrap` needs nothing more. It uses your own venv (`--venv`).
+3. `--sandbox=podman` needs podman set up for your account once: follow section 3 of
+   agentic-sandbox's
+   [SETUP.md](https://github.com/JaneliaScientificComputingSystems/agentic-sandbox/blob/main/SETUP.md).
+   It uses the image's Python, not a venv. The default image has PyTorch and torchvision.
+
+### Run it
+
+Take a command from this README and add `--sandbox=...`, plus `--ro=` for a dataset outside
+the working directory:
+
+```bash
+# Bubblewrap, with your venv
+./submit_torchrun_job.sh 2 --queue=gpu_h100_parallel --venv=~/torch_env \
+    --sandbox=bwrap --ro=/nrs/ml_datasets \
+    --script=vit_imagenet_torchrun.py -- \
+    --model-size=base --epochs=5 --batch-size=64 --save-models
+
+# podman, with the image's own PyTorch (no --venv)
+./submit_torchrun_job.sh 2 --queue=gpu_h200_parallel --sandbox=podman --script=test_torchrun.py
+```
+
+| Option | Meaning |
+|---|---|
+| `--sandbox=bwrap\|podman` | which sandbox |
+| `--sandbox-dir=PATH` | where `sandbox-run.sh` / `podman-run.sh` live; default `$AGENTIC_SANDBOX_DIR`, else `PATH` |
+| `--image=IMAGE` | podman only; default `agentic-sandbox-gpu` |
+| `--ro=PATH`, `--rw=PATH` | extra directories the worker may read / write (repeatable) |
+
+### What the sandbox sees
+
+| Directory | Access | Who adds it |
+|---|---|---|
+| the working directory (`--workdir`, default the script's directory) | read and write | the launcher |
+| the output directory (job logs) | read and write | the launcher |
+| `../models` beside the working directory (checkpoints from `--save-models`) | read and write | the launcher: always for code in this repository, otherwise only if the directory exists |
+| the script's directory and, with `bwrap`, your venv | read | the launcher |
+| datasets such as `/nrs/ml_datasets`, and anything else the script reads or writes | | you: `--ro=` / `--rw=` |
+
+Nothing else of your account is visible: no home directory, keys or tokens.
+
+### The network
+
+The launcher picks the network; there is nothing to choose:
+
+| Job | Network inside the sandbox |
+|---|---|
+| 2+ nodes | the node's own network, not limited, so that the nodes reach each other. Files, home directory, keys and tokens stay hidden as always |
+| 2+ nodes on an InfiniBand queue (B300, H200, H100) | the same, with the InfiniBand devices: NCCL's data goes over InfiniBand directly |
+| one node | none (on an InfiniBand queue the InfiniBand devices are still there) |
+
+### Limits
+
+- `--conda` and `--modules` do not work with `--sandbox`. Use `--venv` with `bwrap`, or an image
+  with `podman`. A host venv does not work inside a container.
+- With `podman` the image is pulled on every node before the workers start.
+- The cluster accepts a multi-node GPU job only on a `*_parallel` queue and only with whole
+  nodes, which is what this launcher asks for. Each sandbox therefore has its node to itself.

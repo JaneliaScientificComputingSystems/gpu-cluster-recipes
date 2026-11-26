@@ -20,7 +20,7 @@
 #       --output=../models/gemma4_myadapter -- --epochs=3 --max-steps=-1
 #
 # Queue guidance: Gemma-4-26B in 16-bit needs ~52 GB resident + optimizer/activations,
-# so use an 80 GB-class GPU: gpu_h100 (recommended), gpu_h200, or gpu_b300.
+# so use an 80 GB-class GPU: gpu_h100 (recommended), gpu_rtx6000, gpu_h200, or gpu_b300.
 #===============================================================================
 set -euo pipefail
 
@@ -57,7 +57,7 @@ while [ $# -gt 0 ]; do
 done
 
 case "$QUEUE" in
-    gpu_h100|gpu_h200|gpu_b300) ;;
+    gpu_h100|gpu_rtx6000|gpu_h200|gpu_b300) ;;
     *) echo "WARNING: '$QUEUE' is not an 80 GB-class GPU queue — Gemma-4-26B 16-bit may not fit." >&2 ;;
 esac
 

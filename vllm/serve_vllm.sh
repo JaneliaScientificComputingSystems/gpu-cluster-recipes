@@ -137,7 +137,7 @@ if [ -z "$QUEUE" ]; then
   [ -n "$BYTES" ] || BYTES=$( du -sb "$MODEL" 2>/dev/null | cut -f1 || true )
   HEUR=$(awk -v b="${BYTES:-0}" 'BEGIN{ n=b/1e9*1.3;
      if(n<=22)print "gpu_l4 1"; else if(n<=76)print "gpu_h100 1";
-     else if(n<=138)print "gpu_h200 1"; else if(n<=260)print "gpu_b300 1";
+     else if(n<=91)print "gpu_rtx6000 1"; else if(n<=138)print "gpu_h200 1"; else if(n<=260)print "gpu_b300 1";
      else if(n<=276)print "gpu_h200 2"; else {g=int(n/260); if(g*260<n)g++; print "gpu_b300 " g} }')
   QUEUE="${HEUR%% *}"; : "${GPUS:=${HEUR##* }}"
   echo "[auto] ~$(awk -v b=${BYTES:-0} 'BEGIN{printf "%.0f", b/1e9}') GB weights -> queue=$QUEUE gpus=$GPUS (size heuristic)"

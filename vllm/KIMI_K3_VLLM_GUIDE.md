@@ -65,21 +65,6 @@ Podman variant (vendor image, GPU via CDI):
 
 ---
 
-## Verified load timings (full B300, max-model-len 32768)
-
-| run | image/SIF prep | weight load | launch → serving |
-|---|---|---|---|
-| **podman**, cold node | 107 s (pull 25 GB) | 759 s | **1382 s (~23 min)** |
-| **apptainer**, cold node | 0 s (SIF pre-staged) | 565 s | **1221 s (~20 min)** |
-| **podman**, warm re-serve (same node) | 1 s (cached) | fast (page cache) | **756 s (~13 min)** |
-
-Notes: Apptainer wins cold-start (no 25 GB pull). A warm node (image cached in `/scratch`,
-weights still in the ~3.9 TB page cache) roughly halves startup. The 1.5 TB NFS read is
-front-loaded (first ~16/96 shards slow, then ~1.6 s/shard), and after weights load vLLM spends a
-few minutes autotuning FP4-MoE kernels + capturing CUDA graphs before `/health` goes green.
-
----
-
 ## Talking to Kimi-K3
 
 Standard OpenAI API (model id `kimi-k3`) — see the general guide §6 for curl/Python. The server
@@ -95,11 +80,3 @@ For the browser UI, `--webui` (above) or `serve_openwebui.sh --model-url http://
 --api-key-file <key file>`. The UI asks for a login; the first account created is the admin (general
 guide §7). Both the API and the UI are reached directly at `http://<node>.int.janelia.org:<port>` —
 no SSH tunnel.
-
----
-
-## Everything else
-
-Engines & one-time setup, clients, Open WebUI details, direct access by node hostname, tuning, and the full
-troubleshooting table (including the `/nrs` `--cleanenv` fix, the bsub slot-ratio hang, CDI, and
-Fabric-Manager CUDA-802) are in **[VLLM_SERVING_GUIDE.md](VLLM_SERVING_GUIDE.md)**.

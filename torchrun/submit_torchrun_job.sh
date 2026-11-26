@@ -68,8 +68,9 @@ usage() {
     echo "  --sandbox-dir=PATH   Where sandbox-run.sh / podman-run.sh live (default: \$AGENTIC_SANDBOX_DIR,"
     echo "                       else wherever they are found on PATH)"
     echo "  --image=IMAGE        Container image for --sandbox=podman (default: agentic-sandbox-gpu)"
-    echo "  --ro=PATH, --rw=PATH Extra directory the sandboxed worker may read / write (repeatable);"
-    echo "                       datasets and checkpoints outside the working directory"
+    echo "  --ro=PATH, --rw=PATH Extra directory the sandboxed worker may read / write (repeatable),"
+    echo "                       e.g. --ro=/nrs/ml_datasets. Already writable: the working directory,"
+    echo "                       the output directory and ../models beside the working directory"
     echo ""
     echo "Script arguments: use '--' separator"
     echo "  Example: $0 2 --script=train.py -- --epochs=50 --batch-size=128"
@@ -416,6 +417,12 @@ if [ -n "$SANDBOX" ]; then
     }
     if [ "$SANDBOX" = podman ]; then sb_add rw "$WORK_DIR"; else SB_RW+=("$(cd "$WORK_DIR" && pwd -P)"); fi
     sb_add rw "$OUTPUT_DIR"
+    # ../models beside the working directory is where this repository's examples save
+    # checkpoints. It is created for a working directory inside this repository; for other
+    # code it is added only if it is already there.
+    MODELS_DIR="$WORK_DIR/../models"
+    [ "$(cd "$WORK_DIR/.." && pwd -P)" = "$(cd "$SCRIPT_DIR/.." && pwd -P)" ] && mkdir -p "$MODELS_DIR"
+    [ -d "$MODELS_DIR" ] && sb_add rw "$MODELS_DIR"
     for d in ${SANDBOX_RW[@]+"${SANDBOX_RW[@]}"}; do sb_add rw "$d"; done
     sb_add ro "$(dirname "$PYTHON_SCRIPT")"
     [ -n "$VENV_PATH" ] && sb_add ro "$VENV_PATH"

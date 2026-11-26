@@ -16,7 +16,6 @@ than a stock `transformers`+`peft` loop. Companion to the Janelia guide
 | `unsloth_gemma4_lora.py` | Single-GPU **LoRA** training script — 16-bit LoRA on the language layers |
 | `submit_unsloth.sh` | LSF submit wrapper for the LoRA example (single GPU, caches on `/scratch`) |
 | `fsdp_sft.py` | Multi-node **full fine-tune** training script — FSDP `FULL_SHARD` (dense LLM) |
-| [`DENSE_VS_MOE_FINETUNING.md`](DENSE_VS_MOE_FINETUNING.md) | Reference: dense vs MoE architecture, why MoE is now standard, parallelism, and full/LoRA/QLoRA fine-tuning approaches |
 
 ---
 
@@ -115,12 +114,9 @@ Options (see `./submit_unsloth.sh --help`): `--queue` (default `gpu_h100`), `--d
 `--model`, `--max-samples`, `--max-steps`, `--epochs`, `--walltime`, `--venv`.
 
 **Queue guidance:** Gemma-4-26B in 16-bit needs an 80 GB-class GPU — `gpu_h100` (recommended),
-`gpu_h200`, or `gpu_b300`. Fine-tuning is single-GPU (`num=1`); the wrapper puts `HF_HOME`,
+`gpu_rtx6000`, `gpu_h200`, or `gpu_b300`. Fine-tuning is single-GPU (`num=1`); the wrapper puts `HF_HOME`,
 `TMPDIR`, and `XDG_CACHE_HOME` on node-local `/scratch` since the shared trees are read-only for
 caching.
-
-> ✅ Validated 2026-08-08 (1× B300): loads the 52 GB base, applies LoRA to the language layers
-> (**494M trainable params = 1.88%** of 26.3B), trains, and saves adapters cleanly.
 
 ---
 
@@ -146,16 +142,14 @@ Unsloth/LoRA above is single-GPU. To **full-fine-tune** a model too large to hol
 state) on one GPU, `fsdp_sft.py` shards params + gradients + optimizer state across every GPU with
 PyTorch **FSDP `FULL_SHARD`** (ZeRO-3) and runs across nodes over InfiniBand. Default target is the
 dense **Qwen2.5-72B-Instruct** (~1.1 TB of training state → ~2 nodes minimum). Dense on purpose —
-FSDP full-shard composes cleanly with a dense model; a large MoE would also need expert parallelism
-(see [`DENSE_VS_MOE_FINETUNING.md`](DENSE_VS_MOE_FINETUNING.md)).
+FSDP full-shard composes cleanly with a dense model; a large MoE would also need expert parallelism.
 
 It's a HuggingFace `TRL` `SFTTrainer` job configured for FSDP, launched with the shared multi-node
 launcher in [`../torchrun/`](../torchrun/) (which sets `RANK`/`WORLD_SIZE`/`LOCAL_RANK` and the
 InfiniBand NCCL env — HF Trainer reads them automatically):
 
-> ✅ Validated 2026-08-08 (2 nodes / 16× B300): Qwen2.5-72B loads, FSDP `FULL_SHARD` trains (loss
-> drops cleanly), and rank 0 saves a complete, loadable HF checkpoint (6 safetensors shards +
-> config/tokenizer). Point `--output` at a **shared, persistent** path (the default `../models/…`
+> Rank 0 saves a complete, loadable HF checkpoint (safetensors shards + config/tokenizer). Point
+> `--output` at a **shared, persistent** path (the default `../models/…`
 > lives on `/groups`) — node-local `/scratch` is per-node and ephemeral. The full save is fp32, so
 > the checkpoint is ~2× the bf16 base size.
 
@@ -200,7 +194,4 @@ default 0 = off), `--ddp-timeout` (default 3600 s). Effective batch =
 The **same script scales to larger dense models** by swapping `--model` (and `--layer-cls` if the
 architecture differs) and adding nodes — e.g. `meta-llama/Llama-3.1-405B` genuinely needs ~8 nodes.
 
-> Full-parameter FT is bandwidth-heavy: `FULL_SHARD` all-gathers every layer's weights each forward
-> and reduce-scatters gradients each backward, across nodes — so this doubles as a real-world
-> InfiniBand workload. Serve the result with [`../vllm/`](../vllm/) (`serve_vllm.sh` knows
-> Qwen2.5-72B).
+Serve the result with [`../vllm/`](../vllm/) (`serve_vllm.sh` knows Qwen2.5-72B).

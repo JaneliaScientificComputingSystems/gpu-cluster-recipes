@@ -19,9 +19,6 @@ Apptainer and auto-selects the queue/GPUs/parsers from the model path:
 ```bash
 # serve a model (auto: picks queue, GPU count, and tool/reasoning parsers):
 ./serve_vllm.sh --model /misc/hf/openai/gpt-oss-20b
-
-# ...or serve + a browser chat UI, printing its URL:
-./serve_vllm.sh --model /misc/hf/Qwen/Qwen3-32B --webui
 ```
 
 **Engine order of preference: Apptainer → venv → Podman.**
@@ -47,7 +44,7 @@ Choose the **smallest** GPU (or fewest GPUs) whose **total** memory clears that.
 tensor-parallel (`--gpus N`, `--tp N`) when one GPU isn't enough.
 
 **GPU memory per class (approx):** L4 = 24 GB · A100 = 80 GB · H100 = 80 GB ·
-H200 = 141 GB · **B300 ≈ 268 GB** (275 GB reported).
+RTX PRO 6000 = 96 GB · H200 = 141 GB · **B300 ≈ 268 GB** (275 GB reported).
 
 **Recommended placement for the staged models** (weights ≈ on-disk; verify against vLLM's
 `Model loading took … GiB` log line and raise if you need long context / more users):
@@ -65,11 +62,6 @@ H200 = 141 GB · **B300 ≈ 268 GB** (275 GB reported).
 
 > These are starting points. Small MXFP4 models (e.g. gpt-oss-20b) use *less* live VRAM than
 > their disk size suggests, so they may fit a smaller GPU; long context needs *more* (KV cache).
-
-> ✅ **Validated (2026-08-08):** all of the above served cleanly at the auto-selected placement —
-> gpt-oss-20b / Qwen3-30B-A3B / gemma-4 on 1× H100; Qwen3-32B on 1× H200; gpt-oss-120b &
-> Mistral-Small-4 on 2× H200 — loading in ~200–360 s, with chat working and tool calling confirmed
-> for gemma-4 (`gemma4`), Qwen3 (`hermes`) and Mistral (`mistral`).
 
 **Node sharing:** models that need only 1–few GPUs can share a node with other jobs — request
 just what you need (`--gpus N`, default `exclusive_process`; others use the node's remaining
@@ -177,7 +169,8 @@ Run `./serve_vllm.sh --help` for all.
 
 The script picks CPU slots to match the queue's ratio (12/GPU; 8 on L4, 16 on RTX 6000), times the load,
 waits for `/health`, and smoke-tests. The server binds `0.0.0.0:8000` → reachable at
-`http://<node>.int.janelia.org:8000/v1` from anywhere on the internal network or VPN.
+`http://<node>.int.janelia.org:8000/v1` from anywhere on the internal network or VPN, with no SSH
+tunnel. Find the node in the `EXEC_HOST` column of `bjobs`.
 
 ### API key (on by default)
 
@@ -306,22 +299,7 @@ Run the UI as a **separate small CPU-only job** pointed at your model (not co-ho
 
 ---
 
-## 8. Reaching it from your machine
-
-Compute nodes are reachable **directly by hostname** from the internal network and VPN — no SSH
-tunnel is needed. Find the node with `bjobs` (the `EXEC_HOST` column) and use its FQDN:
-
-```
-http://<node>.int.janelia.org:8000/v1     # model API  (needs the API key, §4)
-http://<node>.int.janelia.org:8080        # Open WebUI (needs a login, §7)
-```
-
-That reachability is the reason both are protected by default: a service bound to `0.0.0.0` on a
-compute node is visible to everyone on the network.
-
----
-
-## 9. Tuning
+## 8. Tuning
 
 - **`--max-model-len`** — 32768 default; raise as KV-cache budget allows (weights first, the rest
   of HBM becomes KV cache). Bigger context ⇒ fewer concurrent sequences.
@@ -330,7 +308,7 @@ compute node is visible to everyone on the network.
 
 ---
 
-## 10. Troubleshooting
+## 9. Troubleshooting
 
 | Symptom | Cause / fix |
 |---|---|
@@ -347,32 +325,6 @@ compute node is visible to everyone on the network.
 | Job exits with `port … is already in use` or `rejected this job's API key` | Another server on that shared node holds the port. Resubmit with a distinct `--port`. (With `--no-api-key` the second check is skipped, so a client can still hit the wrong model.) |
 | `401 Unauthorized` from `/v1/...` | The server requires its API key (§4): send `Authorization: Bearer $(cat <key file>)`. A key from an earlier job does not work — each job has its own unless you exported `VLLM_API_KEY`. |
 | Open WebUI lists no models / chat errors with 401 | The UI was started without the model's key. Relaunch with `--api-key-file <key file>`. |
-
----
-
-## 11. Model catalog — what each is good for
-
-Brief, practical notes (all served identically via `serve_vllm.sh`):
-
-- **`openai/gpt-oss-120b` / `gpt-oss-20b`** — OpenAI open-weight MoE (MXFP4), strong general
-  reasoning, agentic/tool use, and coding. 120b is the frontier-quality option (2× H200 / 1× B300);
-  20b is fast and cheap (1 GPU) for iteration, drafting, and high-throughput tasks.
-- **`Qwen/Qwen3-32B`** — dense 32B, excellent multilingual, coding, and instruction following;
-  a strong general-purpose default when you want dense-model quality on ~1 big GPU.
-- **`Qwen/Qwen3-30B-A3B`** — MoE with only ~3B active params: **very fast / cheap** per token while
-  near 30B quality. Great default for interactive chat and high request volume.
-- **`Qwen/Qwen2.5-72B-Instruct`** — dense 72B, top-tier general/coding/multilingual quality when you
-  want the strongest dense model; needs 2× H200 (TP=2) / B300. Instruct (not a reasoning model). Also
-  the base model for the FSDP full fine-tune in [`../finetune/`](../finetune/).
-- **`google/gemma-4-26B-A4B-it`** — Google's efficient instruction-tuned MoE; solid general
-  assistant, summarization, and safe/aligned responses; fits one big GPU.
-- **`mistralai/Mistral-Small-4-119B-2603`** — Mistral's efficient large model; strong general +
-  coding + European-language performance; needs 2× H200 / B300.
-- **`moonshotai/Kimi-K3`** — frontier agentic model: long-horizon coding, native multimodality
-  (text+image), 1M-token context. Whole B300 node — see **[KIMI_K3_VLLM_GUIDE.md](KIMI_K3_VLLM_GUIDE.md)**.
-
-> Version names/dates evolve; treat strengths as typical for the family. Benchmark on your own
-> tasks before committing to one for production.
 
 ---
 

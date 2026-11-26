@@ -6,10 +6,10 @@ Six ready-to-run examples:
 
 | Example | Model | Dataset | Purpose |
 |---------|-------|---------|---------|
-| CIFAR-10 | ResNet-18 (11M) | 60K images, 170 MB | Quick smoke test — minutes on 2 nodes |
-| GPT-2 | GPT-2 small–2.7B | OpenWebText, 9 GB | Language model — scales from quick tests to full IB stress tests |
+| CIFAR-10 | ResNet-18 (11M) | 60K images, 170 MB | Quick smoke test |
+| GPT-2 | GPT-2 small–2.7B | OpenWebText, 9 GB | Language model, DDP or FSDP |
 | ImageNet ResNet | ResNet-50 (25.6M) | ImageNet-1K, 138 GB | Industry-standard CNN benchmark |
-| ImageNet ViT | ViT base–huge (86M–632M) | ImageNet-1K, 138 GB | Vision Transformer — modern architecture, heavier IB load |
+| ImageNet ViT | ViT base–huge (86M–632M) | ImageNet-1K, 138 GB | Vision Transformer |
 | Cell Segmentation | Swin-B (88M) | LIVECell, 2 GB | Fine-tuning a pretrained model for microscopy — transfer learning |
 | Sequence Search | — (CPU only) | UniRef90, 28 GB | Distributed protein sequence search — k-mer similarity against BLAST DB |
 
@@ -24,8 +24,11 @@ Six ready-to-run examples:
 | `gpu_b300_parallel` | B300 | 8 | InfiniBand XDR 800 Gb/s | 96 |
 | `gpu_h200_parallel` | H200 | 8 | InfiniBand NDR 400 Gb/s | 96 |
 | `gpu_h100_parallel` | H100 | 8 | InfiniBand NDR 400 Gb/s | 96 |
+| `gpu_rtx6000_parallel` | RTX PRO 6000 | 8 | Ethernet | 128 |
+| `gpu_l4_parallel` | L4 | 8 | Ethernet | 64 |
+| `gpu_a100_parallel` | A100 | 4 | Ethernet | 48 |
 
-Parallel queues are for jobs of 2 or more whole nodes. Site policy: never submit a single-node or partial-node job to a `*_parallel` queue — `submit_ray_job.sh` and `run_inference.sh` refuse it. `gpu_l4_parallel`, `gpu_a100_parallel` and `gpu_rtx6000_parallel` (Ethernet) are also supported.
+Parallel queues are for jobs of 2 or more whole nodes. Site policy: never submit a single-node or partial-node job to a `*_parallel` queue — `submit_ray_job.sh` and `run_inference.sh` refuse it.
 
 **Non-parallel queues** — single node, request 1-8 GPUs with `--num-gpus`:
 
@@ -69,37 +72,6 @@ pip install scipy scikit-image pycocotools
 
 ---
 
-## Files
-
-| File | Description |
-|------|-------------|
-| `submit_ray_job.sh` | LSF job submission for GPU training — auto-configures NCCL per queue |
-| `submit_ray_cpu_job.sh` | LSF job submission for CPU workloads — multi-node Ray Data pipelines |
-| `run_inference.sh` | LSF job submission for inference (single GPU) |
-| `cifar10_distributed_training.py` | ResNet-18 on CIFAR-10 — multi-node DDP |
-| `prepare_openwebtext.sh` | Downloads and tokenizes OpenWebText (already done — for reference) |
-| `gpt2_distributed_training.py` | GPT-2 (117M–2.7B) — DDP and FSDP modes |
-| `prepare_imagenet.sh` | Downloads ImageNet-1K (already done — for reference) |
-| `imagenet_distributed_training.py` | ResNet-50 on ImageNet-1K — distributed benchmark |
-| `image_classifier.py` | CIFAR-10 inference with trained checkpoints |
-| `gpt2_eval.py` | GPT-2 perplexity evaluation on val set |
-| `gpt2_generate.py` | GPT-2 text generation from checkpoints |
-| `vit_imagenet_distributed_training.py` | ViT (86M–632M) on ImageNet-1K — Vision Transformer DDP |
-| `imagenet_classifier.py` | ImageNet inference (ResNet-50) with trained checkpoints |
-| `vit_imagenet_classifier.py` | ImageNet inference (ViT) with trained checkpoints |
-| `prepare_livecell.sh` | Downloads LIVECell dataset (already done — for reference) |
-| `prepare_livecell_masks.py` | Precomputes semantic masks from COCO annotations (already done) |
-| `livecell_finetune.py` | Swin-B fine-tuning on LIVECell — cell segmentation |
-| `cell_segmenter.py` | Cell segmentation inference — produces colored masks |
-| `sequence_search.py` | Distributed protein sequence search — k-mer similarity against FASTA DB |
-| `test_queries.fasta` | Sample protein sequences to try with `sequence_search.py --query` |
-| `gpt2_model.py` | GPT-2 architecture, shared by the GPT-2 training, evaluation and generation scripts |
-| `resnet18_cifar.py` | ResNet-18 for CIFAR-10, shared by the CIFAR-10 training and inference scripts |
-| `train_utils.py` | Helper shared by the training scripts: sums counters across ranks for correct metrics |
-| `train_logging.py` | Helper shared by the training scripts: writes rank-0 progress lines straight to a file |
-
----
-
 ## Submission Script
 
 ```
@@ -130,68 +102,11 @@ Script args go after '--':
     --script=train.py -- --num-gpus=2 --num-nodes=1
 ```
 
-### Running Ray in a sandbox (`--sandbox`)
+**In a sandbox:** add `--sandbox=bwrap` or `--sandbox=podman` to run code you did not write
+yourself (such as code an AI agent wrote) where it cannot see your home directory, keys or
+tokens. See [Running Ray in a sandbox](#running-ray-in-a-sandbox---sandbox).
 
-`--sandbox=bwrap` or `--sandbox=podman` runs Ray and your script inside a sandbox from
-[agentic-sandbox](https://github.com/JaneliaScientificComputingSystems/agentic-sandbox), one per
-node. The launcher and the job script stay outside. Use it for code you did not write yourself,
-such as code an AI agent wrote: the sandbox sees the directory you submit from, `../output` and
-what you name with `--ro`/`--rw`, and nothing else of your account (no home directory, keys or
-tokens).
-
-```bash
-# Bubblewrap, with your venv
-./submit_ray_job.sh 2 --queue=gpu_h200_parallel --venv=~/ray_env --sandbox=bwrap \
-    --ro=/nrs/ml_datasets --rw=/scratch/$USER/ray_results \
-    --script=cifar10_distributed_training.py -- --num-gpus=16 --num-nodes=2 --epochs=10
-
-# podman, with the image's own PyTorch and Ray (no --venv)
-./submit_ray_job.sh 2 --queue=gpu_h200_parallel --sandbox=podman \
-    --ro=/nrs/ml_datasets --rw=/scratch/$USER/ray_results \
-    --script=cifar10_distributed_training.py -- --num-gpus=16 --num-nodes=2 --epochs=10
-```
-
-| Option | Meaning |
-|---|---|
-| `--sandbox=bwrap\|podman` | which sandbox |
-| `--sandbox-dir=PATH` | where `sandbox-run.sh` / `podman-run.sh` live; default `$AGENTIC_SANDBOX_DIR`, else `PATH` |
-| `--image=IMAGE` | podman only; default `agentic-sandbox-gpu` (PyTorch, NCCL, Ray, InfiniBand libraries) |
-| `--ro=PATH`, `--rw=PATH` | extra directories the sandbox may read / write (repeatable). A `--rw` directory is created on every node if missing |
-
-Name every directory the script reads or writes outside the submission directory. The examples
-here read `/nrs/ml_datasets` and write Ray's results to `/scratch/$USER/ray_results`.
-
-The launchers need agentic-sandbox from 25 November 2026 or later (`--host-net` and `--ib`):
-clone that repository, or `git pull` an older checkout, and point `--sandbox-dir` or
-`$AGENTIC_SANDBOX_DIR` at its `scripts/` directory.
-
-The launcher picks the network; there is nothing to choose:
-
-| Job | Network inside the sandbox |
-|---|---|
-| 2+ nodes | the node's own network, not limited, so that the nodes reach each other. Files, home directory, keys and tokens stay hidden as always |
-| 2+ nodes on an InfiniBand queue (B300, H200, H100) | the same, with the InfiniBand devices: NCCL's data goes over InfiniBand directly |
-| one node | none; Ray runs on the sandbox's own loopback |
-
-How it differs from a normal run:
-
-- **One sandbox per node holds everything.** The head node's sandbox starts Ray, waits for the
-  other nodes, runs the script and stops Ray. Each other node's sandbox joins and stays until
-  its raylet exits. Without `--sandbox`, Ray daemons are left on each node and the script runs
-  in the job script.
-- **Ray's ports are fixed**, from 11000 up. A multi-node job has its nodes to itself on the
-  parallel queues, so they do not collide with another job. The per-job ports and the per-job
-  temp dir described under [Monitoring](#monitoring) belong to a run without `--sandbox`.
-- **Ray still has no authentication** on two or more nodes (see
-  [Known limitations](#known-limitations)): the sandbox uses the node's network, and the head
-  port is 11001. Someone who attaches runs code inside the sandbox, with what the sandbox sees.
-- **With `podman` the image is pulled on every node first** (about two minutes for the default
-  image on a node that does not have it yet), and a host venv does not work inside it.
-- **Tested:** CIFAR-10, 3 epochs, on two H200 nodes over InfiniBand (60.8% with `podman`,
-  62.3% with `bwrap`) and on two A100 nodes over Ethernet (69.5% with `podman`, 68.9% with
-  `bwrap`).
-- **One node on an InfiniBand queue:** the sandbox has no network, so the launcher drops the
-  network interface that the NCCL settings name; NCCL then uses the loopback.
+---
 
 ## CPU Submission Script
 
@@ -214,61 +129,22 @@ Script args go after '--':
 
 On `cpu_parallel` each 128 CPUs is one whole node. The script discovers the allocation at runtime and starts Ray accordingly.
 
-```bash
-# Search your sequences against UniRef90
-./submit_ray_cpu_job.sh --num-cpus=128 --venv=~/ray_env \
-    --script=sequence_search.py -- --query my_proteins.fasta
+See [Example 6](#example-6-protein-sequence-search-cpu) for commands.
 
-# Test mode — picks sample queries from the DB
-./submit_ray_cpu_job.sh --num-cpus=128 --venv=~/ray_env \
-    --script=sequence_search.py -- --test
-
-# Multi-node — 256 CPUs (2 nodes) for faster search
-./submit_ray_cpu_job.sh --num-cpus=256 --venv=~/ray_env \
-    --script=sequence_search.py -- --query my_proteins.fasta --top-n=20
-```
+---
 
 ## Example 1: CIFAR-10
 
-### About the dataset
+ResNet-18 (11M parameters) on [CIFAR-10](https://www.cs.toronto.edu/~kriz/cifar.html), trained with DDP.
+The smallest example; use it to check that multi-node training works.
 
-[CIFAR-10](https://www.cs.toronto.edu/~kriz/cifar.html) is 60,000 color images (32x32 pixels) in 10 classes: airplane, automobile, bird, cat, deer, dog, frog, horse, ship, and truck. 50,000 training images and 10,000 test images. At 170 MB it's small enough to load instantly on any node.
-
-### What the training does
-
-Trains a ResNet-18 (11M parameters) image classifier using Distributed Data Parallel (DDP). Each GPU processes a different mini-batch, gradients are synchronized via allreduce after each step. Standard data augmentation (random crop, horizontal flip) is applied. The model learns to classify the 10 object categories.
-
-### What it produces
-
-- Training logs with per-epoch accuracy and loss
-- Model checkpoints (`.pth` files) saved to `../models/` when `--save-models` is used
-- Best checkpoint based on test accuracy (~89-91% after 50 epochs)
-- Checkpoints can be used with `image_classifier.py` for inference on new images
-
-### Data
-
-CIFAR-10 is pre-installed at `/nrs/ml_datasets/cifar10` (shared NFS). All scripts use this by default — just run them, no data setup needed.
-
-<details><summary>Preparing your own copy (optional — only if you need a separate location)</summary>
-
-```bash
-mkdir -p /your/path/cifar10 && cd /your/path/cifar10
-wget https://www.cs.toronto.edu/~kriz/cifar-10-python.tar.gz
-tar -xzf cifar-10-python.tar.gz && rm cifar-10-python.tar.gz
-```
-
-`cifar10_distributed_training.py` has no `--data-dir` option — the path is fixed in the script (`dataset_path` in `main()`), so edit it there to train from your copy. `image_classifier.py` accepts `--data-dir=/your/path/cifar10`.
-
-</details>
+Data: `/nrs/ml_datasets/cifar10`. The training script has no `--data-dir`; the path is set in its
+`main()`. `image_classifier.py` takes `--data-dir`.
 
 ### Train
 
-**Quick validation (~2 min on 16 GPUs):** 10 epochs is enough to confirm multi-node training works and see loss converge. Expect ~72% accuracy (validated 2026-08-08: 71.8% at 10 epochs, 16×H200, batch 256/GPU).
-
-**Full training (~5 min on 16 GPUs):** 50 epochs reaches ~89-91% accuracy — diminishing returns beyond that on CIFAR-10.
-
 ```bash
-# Validation run — 10 epochs
+# Short run — 10 epochs
 ./submit_ray_job.sh 2 --queue=gpu_h200_parallel --venv=~/ray_env \
     --script=cifar10_distributed_training.py -- \
     --num-gpus=16 --num-nodes=2 --epochs=10 --batch-size=256 --save-models
@@ -297,65 +173,36 @@ Give the classifier an image — it returns the top-3 predicted CIFAR-10 categor
 
 ## Example 2: GPT-2
 
-### About the dataset
+GPT-2 on [OpenWebText](https://huggingface.co/datasets/Skylion007/openwebtext), trained with DDP or
+FSDP, with gradient accumulation and mixed precision.
 
-[OpenWebText](https://huggingface.co/datasets/Skylion007/openwebtext) is a reproduction of the WebText corpus used to train the original GPT-2. It contains ~8 million web pages scraped from URLs shared on Reddit with at least 3 karma. The text is tokenized with GPT-2's BPE tokenizer (50,257 token vocabulary) into ~4.5 billion tokens. A 0.05% held-out validation split is used for perplexity evaluation.
+Data: tokenized OpenWebText at `/nrs/ml_datasets/openwebtext` (`--data-dir` to change;
+`prepare_openwebtext.sh` builds a copy).
 
 ### Model sizes
 
-Five model sizes are available via `--model-size`. Larger models generate proportionally more network traffic per step — use them to stress-test the IB fabric.
+Five model sizes are available via `--model-size`:
 
-| Size | Layers | Heads | Dim | Params | Allreduce/step | Recommended mode |
-|------|--------|-------|-----|--------|----------------|------------------|
-| `small` | 12 | 12 | 768 | 117M | ~0.5 GB | DDP |
-| `medium` | 24 | 16 | 1024 | 345M | ~1.4 GB | DDP |
-| `large` | 36 | 20 | 1280 | 774M | ~3.1 GB | DDP |
-| `xl` | 48 | 25 | 1600 | 1.5B | ~6.0 GB | DDP or FSDP |
-| `2b` | 56 | 32 | 2048 | 2.7B | ~10.8 GB | FSDP |
-
-### What the training does
-
-Trains GPT-2 to predict the next token in a sequence. Uses DDP or FSDP for distributed training with gradient accumulation (effective batch = batch_size × grad_accum × num_gpus sequences). Mixed precision (bfloat16 on H200/H100) with cosine LR schedule and warmup. Gradient data is synchronized across all GPUs via allreduce (DDP) or reduce-scatter/allgather (FSDP) — this creates sustained IB traffic that scales with model size.
-
-### What it produces
-
-- Training logs with loss, learning rate, and tokens/sec throughput
-- Periodic validation loss (perplexity) evaluation
-- Model checkpoints (`.pth` files) saved to `../models/`
-- Trained models can be evaluated with `gpt2_eval.py` or used for text generation with `gpt2_generate.py`
-
-### Data
-
-Tokenized OpenWebText is pre-installed at `/nrs/ml_datasets/openwebtext` (shared NFS). All scripts use this by default — just run them, no data setup needed.
-
-<details><summary>Preparing your own copy (optional — only if you need a separate location)</summary>
-
-```bash
-pip install datasets tiktoken
-./prepare_openwebtext.sh --data-dir=/your/path
-```
-
-</details>
+| Size | Layers | Heads | Dim | Params | Recommended mode |
+|------|--------|-------|-----|--------|------------------|
+| `small` | 12 | 12 | 768 | 117M | DDP |
+| `medium` | 24 | 16 | 1024 | 345M | DDP |
+| `large` | 36 | 20 | 1280 | 774M | DDP |
+| `xl` | 48 | 25 | 1600 | 1.5B | DDP or FSDP |
+| `2b` | 56 | 32 | 2048 | 2.7B | FSDP |
 
 ### Train
 
 GPT-2 uses iteration count, not epochs. Each iteration processes `batch_size × grad_accum × num_gpus` sequences (1024 tokens each). With the defaults below, effective batch = 1,048,576 tokens/iter.
 
-**Quick validation (~45 min on 16 GPUs):** 2000 iters processes ~2B tokens — enough to verify the pipeline, see loss drop, and confirm IB throughput.
-
-**Full training (~6h on 16 GPUs):** 50K iters processes ~50B tokens (~5 passes over OpenWebText). Expect perplexity ~29 at convergence.
-
-> ✅ Validated 2026-08-08: 2-node / 16-GPU DDP run starts a clean Ray cluster, connects all ranks
-> over InfiniBand (`NET/IB/*/GDRDMA`), and trains to a clean exit.
-
 ```bash
-# Validation run — GPT-2 small, 2000 iters
+# Short run — GPT-2 small, 2000 iters
 ./submit_ray_job.sh 2 --queue=gpu_h200_parallel --venv=~/ray_env \
     --script=gpt2_distributed_training.py -- \
     --num-gpus=16 --num-nodes=2 --mode=ddp \
     --max-iters=2000 --batch-size=8 --grad-accum=8 --save-models
 
-# Full run — 50K iters (~6h: needs --walltime, the default for 2 nodes is 4h)
+# Full run — 50K iters (set --walltime: the default for 2 nodes is 4h)
 ./submit_ray_job.sh 2 --queue=gpu_h200_parallel --venv=~/ray_env \
     --walltime=8:00 \
     --script=gpt2_distributed_training.py -- \
@@ -363,24 +210,15 @@ GPT-2 uses iteration count, not epochs. Each iteration processes `batch_size × 
     --max-iters=50000 --batch-size=8 --grad-accum=8 --save-models
 ```
 
-#### IB stress tests (larger models)
-
-Larger model sizes generate significantly more cross-node traffic. Use FSDP for `2b` — it shards parameters across GPUs, adding allgather + reduce-scatter traffic on top of gradient sync.
+Larger sizes take `--model-size` and, for `2b`, `--mode=fsdp`:
 
 ```bash
-# GPT-2 XL (1.5B) — DDP, 64 GPUs
-./submit_ray_job.sh 8 --queue=gpu_h200_parallel --venv=~/ray_env \
-    --job-name=gpt2_xl \
-    --script=gpt2_distributed_training.py -- \
-    --num-gpus=64 --num-nodes=8 --model-size=xl --mode=ddp \
-    --max-iters=500 --batch-size=4 --grad-accum=4
-
-# GPT-2 2.7B — FSDP, 64 GPUs (heaviest IB load)
+# GPT-2 2.7B — FSDP, 8 nodes / 64 GPUs
 ./submit_ray_job.sh 8 --queue=gpu_h200_parallel --venv=~/ray_env \
     --job-name=gpt2_2b \
     --script=gpt2_distributed_training.py -- \
     --num-gpus=64 --num-nodes=8 --model-size=2b --mode=fsdp \
-    --max-iters=500 --batch-size=2 --grad-accum=8
+    --max-iters=500 --batch-size=2 --grad-accum=8 --save-models
 ```
 
 #### Batch size reference by model size (H200, 141 GB)
@@ -395,16 +233,15 @@ Larger model sizes generate significantly more cross-node traffic. Use FSDP for 
 
 ### Evaluate & Generate
 
-**Perplexity evaluation** — measures how well the model predicts held-out text (lower = better, expect ~18-20):
+**Perplexity evaluation** — measures how well the model predicts held-out text (lower = better):
 
 ```bash
 ./run_inference.sh --venv=~/ray_env --script=gpt2_eval.py -- \
     --model ../models/gpt2_small_ddp_best.pth --num-batches 200
 
 # For larger models, specify --model-size to match the checkpoint
-# (the XL stress-test command above does not pass --save-models; add it to get this file)
 ./run_inference.sh --venv=~/ray_env --script=gpt2_eval.py -- \
-    --model ../models/gpt2_xl_ddp_best.pth --model-size=xl --num-batches 200
+    --model ../models/gpt2_2b_fsdp_best.pth --model-size=2b --num-batches 200
 ```
 
 **Text generation** — GPT-2 is a text completion model, not a chatbot. Give it the start of a sentence and it continues writing in the style of web articles:
@@ -428,46 +265,17 @@ python gpt2_generate.py --model ../models/gpt2_small_ddp_best.pth --interactive
 
 ## Example 3: ResNet-50 on ImageNet-1K
 
-### About the dataset
+ResNet-50 (25.6M parameters) on [ImageNet-1K](https://huggingface.co/datasets/ILSVRC/imagenet-1k),
+trained with DDP and large-batch SGD in mixed precision. Data is streamed with Ray Data from
+parquet shards.
 
-[ImageNet-1K (ILSVRC2012)](https://huggingface.co/datasets/ILSVRC/imagenet-1k) is the standard benchmark for image classification. 1,281,167 training images and 50,000 validation images across 1,000 object categories ranging from animals (tench, goldfinch, tree frog) to objects (laptop, sunglasses, volcano) to scenes (lakeside, valley). Images are variable-size JPEGs, resized to 224x224 during training. This is the dataset used in MLPerf benchmarks and NVIDIA DGX cluster validation.
-
-### What the training does
-
-Trains ResNet-50 (25.6M parameters) using DDP with large-batch SGD (momentum 0.9, weight decay 1e-4). Learning rate is linearly scaled by effective batch size (lr = base_lr × effective_batch / 256) with linear warmup and cosine decay. Mixed precision (bfloat16). Data is streamed via Ray Data from parquet shards — no DataLoader subprocesses or memmapping. Each training step produces ~100 MB of gradient data synchronized via allreduce, creating sustained IB traffic at scale.
-
-### What it produces
-
-- Training logs with per-epoch top-1 accuracy, loss, learning rate, and images/sec throughput
-- Periodic validation with top-1 and top-5 accuracy
-- Model checkpoints (`.pth` files) saved to `../models/`
-- Target: ~76%+ top-1 accuracy after 90 epochs (~3h on 16x H200)
-
-### Data
-
-ImageNet-1K is pre-installed at `/nrs/ml_datasets/imagenet` (shared NFS, ~138 GB). All scripts use this by default — just run them, no data setup needed.
-
-<details><summary>Preparing your own copy (optional — only if you need a separate location)</summary>
-
-1. Create a [HuggingFace](https://huggingface.co) account
-2. Accept the license at [ILSVRC/imagenet-1k](https://huggingface.co/datasets/ILSVRC/imagenet-1k)
-3. Create a token at [Settings > Tokens](https://huggingface.co/settings/tokens)
-
-```bash
-export HF_TOKEN="hf_..."
-./prepare_imagenet.sh --data-dir=/your/path
-```
-
-</details>
+Data: `/nrs/ml_datasets/imagenet` (`--data-dir` to change; `prepare_imagenet.sh` downloads a copy
+and needs a Hugging Face token with the ImageNet license accepted).
 
 ### Train
 
-**Quick validation (~20 min on 16 GPUs):** 3 epochs is enough to confirm the data pipeline works, see loss drop, and measure throughput. Expect ~25-30% top-1. (✅ validated 2026-08-08: 29.9% top-1 at 3 epochs, 16 GPUs.)
-
-**Full training (~3h on 16 GPUs):** 90 epochs reaches ~76%+ top-1 accuracy — the standard ResNet-50 target used in MLPerf benchmarks.
-
 ```bash
-# Validation run — 3 epochs
+# Short run — 3 epochs
 ./submit_ray_job.sh 2 --queue=gpu_h200_parallel --venv=~/ray_env \
     --job-name=resnet50 \
     --script=imagenet_distributed_training.py -- \
@@ -513,39 +321,19 @@ LR is automatically scaled: `lr = base_lr * effective_batch / 256`.
 
 ## Example 4: ViT on ImageNet-1K
 
-### About the model
+Vision Transformer on ImageNet-1K, trained with DDP and AdamW. It uses the same data and data
+pipeline as Example 3. Three sizes via `--model-size`:
 
-The Vision Transformer (ViT) applies the transformer architecture — the same architecture behind GPT and LLaMA — to image classification. Instead of convolutional layers (ResNet), ViT splits images into 16x16 pixel patches, treats each patch as a token, and processes them through transformer layers with self-attention. This gives every patch global context from the first layer.
-
-Three model sizes are available via `--model-size`:
-
-| Size | Layers | Heads | Dim | Params | Allreduce/step |
-|------|--------|-------|-----|--------|----------------|
-| `base` | 12 | 12 | 768 | 86M | ~0.3 GB |
-| `large` | 24 | 16 | 1024 | 307M | ~1.2 GB |
-| `huge` | 32 | 16 | 1280 | 632M | ~2.5 GB |
-
-### What the training does
-
-Trains ViT on ImageNet-1K using DDP with AdamW optimizer (standard for transformers, unlike SGD for ResNet). Learning rate is scaled linearly by effective batch size / 1024 with linear warmup and cosine decay. Gradient clipping (1.0) is applied for training stability. Same ImageNet data pipeline as the ResNet-50 example.
-
-### What it produces
-
-- Training logs with per-epoch top-1 accuracy, loss, and images/sec throughput
-- Model checkpoints (`.pth` files) saved to `../models/`
-- Trained models can be used with `vit_imagenet_classifier.py` for inference
-
-### Data
-
-Same ImageNet-1K dataset as the ResNet-50 example — pre-installed at `/nrs/ml_datasets/imagenet`.
+| Size | Layers | Heads | Dim | Params |
+|------|--------|-------|-----|--------|
+| `base` | 12 | 12 | 768 | 86M |
+| `large` | 24 | 16 | 1024 | 307M |
+| `huge` | 32 | 16 | 1280 | 632M |
 
 ### Train
 
-> ✅ Validated 2026-08-08: 3-epoch validation run reached **25.6% top-1** (16 GPUs) — confirms the
-> data pipeline, DDP, and throughput. Use the full 90-epoch run for a real model.
-
 ```bash
-# ViT-Large, 2 nodes, 16 GPUs — validation run
+# ViT-Large, 2 nodes, 16 GPUs — short run
 ./submit_ray_job.sh 2 --queue=gpu_h200_parallel --venv=~/ray_env \
     --job-name=vit_large \
     --script=vit_imagenet_distributed_training.py -- \
@@ -557,7 +345,7 @@ Same ImageNet-1K dataset as the ResNet-50 example — pre-installed at `/nrs/ml_
     --script=vit_imagenet_distributed_training.py -- \
     --num-gpus=16 --num-nodes=2 --model-size=large --epochs=90 --batch-size=32 --save-models
 
-# ViT-Huge, 7 nodes, 56 GPUs — heaviest vision workload
+# ViT-Huge, 7 nodes, 56 GPUs
 ./submit_ray_job.sh 7 --queue=gpu_h100_parallel --venv=~/ray_env \
     --job-name=vit_huge \
     --script=vit_imagenet_distributed_training.py -- \
@@ -588,46 +376,15 @@ Same ImageNet-1K dataset as the ResNet-50 example — pre-installed at `/nrs/ml_
 
 ## Example 5: Cell Segmentation (Swin + LIVECell)
 
-### About the example
+Transfer learning: a Swin Transformer pretrained on ImageNet is fine-tuned for cell segmentation
+on [LIVECell](https://www.nature.com/articles/s41592-021-01249-6) microscopy images. The model
+predicts background, cell interior and cell boundary per pixel; a watershed step turns that into
+individual cells. To use it on your own microscopy data, replace the dataset.
 
-This example demonstrates **transfer learning** — the practical workflow most researchers actually use. Instead of training from scratch, we take a Swin Transformer pretrained on ImageNet and fine-tune it for cell segmentation on microscopy images.
-
-The model predicts three classes per pixel: background, cell interior, and cell boundary. Post-processing (watershed) converts the predictions into individual cell instances with colored masks.
-
-### About the dataset
-
-[LIVECell](https://www.nature.com/articles/s41592-021-01249-6) is 5,239 phase contrast microscopy images with 1.6 million manually annotated cell boundaries across 8 cell types (A172, BT474, BV2, Huh7, MCF7, SHSY5Y, SkBr3, SKOV3). Published in Nature Methods.
-
-### What it demonstrates
-
-- **Transfer learning:** Pretrained ImageNet backbone → fine-tune on domain data
-- **Differential learning rates:** Backbone gets 10x lower LR than the new segmentation head
-- **Segmentation pipeline:** From raw microscopy image to colored cell masks
-- **The pattern researchers would use:** swap LIVECell for your own microscopy data
-
-### Data
-
-LIVECell is pre-installed at `/nrs/ml_datasets/livecell` (shared NFS, ~2 GB). Precomputed semantic masks are at `/nrs/ml_datasets/livecell/masks/`.
-
-<details><summary>Preparing your own copy (optional)</summary>
-
-```bash
-# Download dataset
-./prepare_livecell.sh --data-dir=/your/path
-
-# Precompute semantic masks (one-time, uses all CPU cores, ~5 min)
-python prepare_livecell_masks.py --data-dir=/your/path
-```
-
-The mask preprocessing converts COCO instance annotations into per-pixel semantic masks (background/cell/boundary) and saves them as `.npy` files. This must be done once before training.
-
-</details>
+Data: `/nrs/ml_datasets/livecell`, with precomputed masks in `masks/` (`--data-dir` to change;
+`prepare_livecell.sh` and then `prepare_livecell_masks.py` build a copy).
 
 ### Train
-
-> ✅ Validated 2026-08-08: a quick 2-epoch run (`--epochs=2`) confirms the transfer-learning
-> pipeline end-to-end — best mIoU **0.49** at 2 epochs (16 GPUs). Use the full 50-epoch commands
-> below for a real model.
 
 ```bash
 # Fine-tune on 2 H100 nodes (16 GPUs) — 50 epochs
@@ -673,32 +430,15 @@ Output segmented images are saved to `../output/segmentation/`. `run_inference.s
 
 ## Example 6: Protein Sequence Search (CPU)
 
-### About the example
+Searches query protein sequences against UniRef90 by k-mer similarity, a distributed, approximate
+alternative to BLAST. The database is split into chunks, each CPU scores its chunk against the
+queries (Jaccard similarity on shared k-mers), and the top hits per query are reported. No GPUs;
+it runs on `cpu_parallel` with `submit_ray_cpu_job.sh`.
 
-Searches query protein sequences against a large FASTA database using **k-mer similarity** — a distributed, approximate alternative to BLAST. The 28 GB UniRef90 database is split into chunks and searched in parallel across all available CPUs. This is the kind of workload researchers typically parallelize with Dask or custom MPI scripts.
-
-No GPUs needed. This runs on the `cpu_parallel` queue using `submit_ray_cpu_job.sh`.
-
-### How it works
-
-1. Parse query sequences and compute their k-mer fingerprints (set of all 3-mers)
-2. Split the 28 GB database into ~100 MB chunks aligned to sequence boundaries
-3. Distribute chunks across all CPUs — each worker reads its chunk, parses sequences, and scores them against the queries using Jaccard similarity on shared k-mers
-4. Merge results and report top hits per query
-
-### What it produces
-
-- Top N most similar database sequences for each query
-- Jaccard similarity scores (0–1, higher = more shared k-mers)
-- Search throughput (GB/s scanned)
-
-### Data
-
-UniRef90 is pre-installed at `/misc/blast/db/uniref90/uniref90.fasta` (28 GB, 83.7M protein sequences). No setup needed.
+Data: `/misc/blast/db/uniref90/uniref90.fasta` (`--db` to change). `test_queries.fasta` here is a
+sample query file.
 
 ### Run
-
-> ✅ Validated 2026-08-08: `--test` mode returns top-10 nearest hits per query (CPU, 128 cores).
 
 ```bash
 # Test mode — picks 5 sample queries from the DB itself
@@ -729,7 +469,7 @@ UniRef90 is pre-installed at `/misc/blast/db/uniref90/uniref90.fasta` (28 GB, 83
 
 ---
 
-### Resume from checkpoint
+## Resume from checkpoint
 
 All scripts support `--resume`:
 
@@ -755,6 +495,95 @@ All scripts support `--resume`:
 ```
 
 Checkpoints: `--save-models` saves `<model>_latest.pth` (every epoch) and `<model>_best.pth` (on improvement) to `../models/`.
+
+---
+
+## Running Ray in a sandbox (`--sandbox`)
+
+`--sandbox=bwrap` or `--sandbox=podman` runs Ray and your script inside a sandbox from
+[agentic-sandbox](https://github.com/JaneliaScientificComputingSystems/agentic-sandbox), one per
+node. The launcher and the job script stay outside. Use it for code you did not write yourself,
+such as code an AI agent wrote. Everything else in this README works the same without it.
+
+### Before you start
+
+1. Clone agentic-sandbox (25 November 2026 or later; `git pull` an older checkout) and point the
+   launcher at its `scripts/` directory:
+
+   ```bash
+   git clone https://github.com/JaneliaScientificComputingSystems/agentic-sandbox.git ~/agentic-sandbox
+   export AGENTIC_SANDBOX_DIR=~/agentic-sandbox/scripts      # or pass --sandbox-dir=...
+   ```
+
+2. `--sandbox=bwrap` needs nothing more. It uses your own venv (`--venv`).
+3. `--sandbox=podman` needs podman set up for your account once: follow section 3 of
+   agentic-sandbox's
+   [SETUP.md](https://github.com/JaneliaScientificComputingSystems/agentic-sandbox/blob/main/SETUP.md).
+   It uses the image's Python, not a venv. The default image has PyTorch, Ray and the packages
+   the examples here import.
+
+### Run it
+
+Take any example command in this README and add `--sandbox=...` and `--ro=/nrs/ml_datasets`:
+
+```bash
+# Bubblewrap, with your venv
+./submit_ray_job.sh 2 --queue=gpu_h200_parallel --venv=~/ray_env \
+    --sandbox=bwrap --ro=/nrs/ml_datasets \
+    --script=cifar10_distributed_training.py -- \
+    --num-gpus=16 --num-nodes=2 --epochs=10 --batch-size=256 --save-models
+
+# podman, with the image's own PyTorch and Ray (no --venv)
+./submit_ray_job.sh 2 --queue=gpu_h200_parallel \
+    --sandbox=podman --ro=/nrs/ml_datasets \
+    --script=cifar10_distributed_training.py -- \
+    --num-gpus=16 --num-nodes=2 --epochs=10 --batch-size=256 --save-models
+```
+
+| Option | Meaning |
+|---|---|
+| `--sandbox=bwrap\|podman` | which sandbox |
+| `--sandbox-dir=PATH` | where `sandbox-run.sh` / `podman-run.sh` live; default `$AGENTIC_SANDBOX_DIR`, else `PATH` |
+| `--image=IMAGE` | podman only; default `agentic-sandbox-gpu` |
+| `--ro=PATH`, `--rw=PATH` | extra directories the sandbox may read / write (repeatable). A `--rw` directory is created on every node if missing |
+
+### What the sandbox sees
+
+| Directory | Access | Who adds it |
+|---|---|---|
+| the directory you submit from (`ray/`) | read and write | the launcher |
+| `../output` (job logs) and `../models` (checkpoints from `--save-models`) | read and write | the launcher |
+| `/scratch/$USER/ray_results` (Ray Train's own results) | read and write | the launcher |
+| your venv, with `bwrap` | read | the launcher |
+| `/nrs/ml_datasets` (the datasets of every GPU example here) | read | you: `--ro=/nrs/ml_datasets` |
+| anything else your own script reads or writes | | you: `--ro=` / `--rw=` |
+
+Nothing else of your account is visible: no home directory, keys or tokens.
+
+### The network
+
+The launcher picks the network; there is nothing to choose:
+
+| Job | Network inside the sandbox |
+|---|---|
+| 2+ nodes | the node's own network, not limited, so that the nodes reach each other. Files, home directory, keys and tokens stay hidden as always |
+| 2+ nodes on an InfiniBand queue (B300, H200, H100) | the same, with the InfiniBand devices: NCCL's data goes over InfiniBand directly |
+| one node | none; Ray runs on the sandbox's own loopback |
+
+### How it differs from a normal run
+
+- **One sandbox per node holds everything.** The head node's sandbox starts Ray, waits for the
+  other nodes, runs the script and stops Ray. Each other node's sandbox joins and stays until
+  its raylet exits. Without `--sandbox`, Ray daemons are left on each node and the script runs
+  in the job script.
+- **Ray's ports are fixed**, from 11000 up. A multi-node job has its nodes to itself on the
+  parallel queues, so they do not collide with another job. The per-job ports and the per-job
+  temp dir described under [Monitoring](#monitoring) belong to a run without `--sandbox`.
+- **Ray still has no authentication** on two or more nodes (see
+  [Known limitations](#known-limitations)): the sandbox uses the node's network, and the head
+  port is 11001. Someone who attaches runs code inside the sandbox, with what the sandbox sees.
+- **Only `submit_ray_job.sh` has `--sandbox`.** `submit_ray_cpu_job.sh` and `run_inference.sh`
+  do not.
 
 ---
 

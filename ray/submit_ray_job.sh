@@ -58,8 +58,9 @@ usage() {
     echo "  --sandbox-dir=PATH   Where sandbox-run.sh / podman-run.sh live (default: \$AGENTIC_SANDBOX_DIR,"
     echo "                       else wherever they are found on PATH)"
     echo "  --image=IMAGE        Container image for --sandbox=podman (default: agentic-sandbox-gpu)"
-    echo "  --ro=PATH, --rw=PATH Extra directory the sandbox may read / write (repeatable): datasets,"
-    echo "                       and where the script writes (e.g. --rw=/scratch/\$USER/ray_results)"
+    echo "  --ro=PATH, --rw=PATH Extra directory the sandbox may read / write (repeatable), e.g."
+    echo "                       --ro=/nrs/ml_datasets. Already writable: the submission directory,"
+    echo "                       ../output, ../models and /scratch/\$USER/ray_results"
     echo ""
     echo "Script arguments: use '--' separator"
     echo "  Example: $0 2 --script=train.py -- --epochs=50 --batch-size=128"
@@ -314,6 +315,10 @@ if [ -n "$SANDBOX" ]; then
     }
     if [ "$SANDBOX" = podman ]; then sb_add rw "$SUBMIT_DIR"; else SB_RW+=("$SUBMIT_DIR"); fi
     sb_add rw "$OUT_ABS"
+    # Where the examples here write: checkpoints in ../models, and Ray Train's own results in
+    # /scratch/$USER/ray_results (node-local, so it is created on every node).
+    mkdir -p ../models && sb_add rw "$(cd ../models && pwd -P)"
+    SB_MKDIR+=("/scratch/$USER/ray_results"); sb_add rw "/scratch/$USER/ray_results"
     for d in ${SANDBOX_RW[@]+"${SANDBOX_RW[@]}"}; do
         case "$d" in /*) ;; *) echo "ERROR: --rw=$d: give an absolute path"; exit 1 ;; esac
         SB_MKDIR+=("$d"); sb_add rw "$d"

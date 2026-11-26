@@ -6,8 +6,8 @@ Runnable recipes for the Janelia GPU cluster (LSF): distributed training with **
 
 **Cluster context:** jobs submit via LSF (`bsub`). GPU queues: `gpu_l4`, `gpu_a100`, `gpu_rtx6000`,
 `gpu_h100`, `gpu_h200`, `gpu_b300` (one node), plus a `*_parallel` variant of each for jobs of two
-or more whole nodes. Shared models
-live under `/misc/hf/`, shared Apptainer images under `/misc/local/singularity/`.
+or more whole nodes. Shared models live under `/misc/hf/`, shared Apptainer images under
+`/misc/local/singularity/`.
 
 ## Contents
 
@@ -15,7 +15,7 @@ live under `/misc/hf/`, shared Apptainer images under `/misc/local/singularity/`
 |---|---|
 | [`ray/`](ray/) | Ray Train examples — CIFAR-10, GPT-2, ImageNet (ResNet-50 / ViT), LIVECell segmentation, protein sequence search — plus `submit_ray_job.sh` |
 | [`torchrun/`](torchrun/) | Multi-node PyTorch launcher `submit_torchrun_job.sh`, a ViT example, and the NCCL/InfiniBand test suite |
-| [`finetune/`](finetune/) | Fine-tuning — single-GPU LoRA (Unsloth, `submit_unsloth.sh`) and multi-node full FT (FSDP, `fsdp_sft.py`), plus a dense-vs-MoE + fine-tuning primer |
+| [`finetune/`](finetune/) | Fine-tuning — single-GPU LoRA (Unsloth, `submit_unsloth.sh`) and multi-node full FT (FSDP, `fsdp_sft.py`) |
 | [`nccl-ib/`](nccl-ib/) | Shared NCCL/InfiniBand env configs (`nccl_ib.sh`, `nccl_ib_b300.sh`), sourced by both launchers on IB queues |
 | [`vllm/`](vllm/) | Serve any Hugging Face model with vLLM (Apptainer / venv / Podman) + optional Open WebUI — see the two guides |
 
