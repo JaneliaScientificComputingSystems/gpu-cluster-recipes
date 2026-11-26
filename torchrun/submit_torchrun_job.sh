@@ -425,7 +425,13 @@ if [ -n "$SANDBOX" ]; then
     [ -d "$MODELS_DIR" ] && sb_add rw "$MODELS_DIR"
     for d in ${SANDBOX_RW[@]+"${SANDBOX_RW[@]}"}; do sb_add rw "$d"; done
     sb_add ro "$(dirname "$PYTHON_SCRIPT")"
-    [ -n "$VENV_PATH" ] && sb_add ro "$VENV_PATH"
+    if [ -n "$VENV_PATH" ]; then
+        sb_add ro "$VENV_PATH"
+        # A venv's python is a link to the interpreter it was made from. One made with uv or
+        # pyenv points outside the venv and outside /usr, to a place the sandbox does not show.
+        PY_ROOT=$(dirname "$(dirname "$(readlink -f "$VENV_PATH/bin/python")")")
+        case "$PY_ROOT" in /usr|/usr/*|/) ;; *) [ -d "$PY_ROOT" ] && sb_add ro "$PY_ROOT" ;; esac
+    fi
     [ "$NETWORK_BACKEND" = "IB" ] && [ -f "$NCCL_ENV_FILE" ] && sb_add ro "$(dirname "$NCCL_ENV_FILE")"
     for d in ${SANDBOX_RO[@]+"${SANDBOX_RO[@]}"}; do sb_add ro "$d"; done
 

@@ -554,7 +554,7 @@ Take any example command in this README and add `--sandbox=...` and `--ro=/nrs/m
 | the directory you submit from (`ray/`) | read and write | the launcher |
 | `../output` (job logs) and `../models` (checkpoints from `--save-models`) | read and write | the launcher |
 | `/scratch/$USER/ray_results` (Ray Train's own results) | read and write | the launcher |
-| your venv, with `bwrap` | read | the launcher |
+| your venv, with `bwrap`, and the Python it was made from (uv, pyenv) | read | the launcher |
 | `/nrs/ml_datasets` (the datasets of every GPU example here) | read | you: `--ro=/nrs/ml_datasets` |
 | anything else your own script reads or writes | | you: `--ro=` / `--rw=` |
 

@@ -197,7 +197,7 @@ the working directory:
 | the working directory (`--workdir`, default the script's directory) | read and write | the launcher |
 | the output directory (job logs) | read and write | the launcher |
 | `../models` beside the working directory (checkpoints from `--save-models`) | read and write | the launcher: always for code in this repository, otherwise only if the directory exists |
-| the script's directory and, with `bwrap`, your venv | read | the launcher |
+| the script's directory and, with `bwrap`, your venv and the Python it was made from (uv, pyenv) | read | the launcher |
 | datasets such as `/nrs/ml_datasets`, and anything else the script reads or writes | | you: `--ro=` / `--rw=` |
 
 Nothing else of your account is visible: no home directory, keys or tokens.
