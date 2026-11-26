@@ -25,7 +25,7 @@ Ray training (run from `ray/`):
 
 ```bash
 ./submit_ray_job.sh 2 --queue=gpu_h200_parallel --venv=~/ray_env \
-    --script=cifar10_distributed_training.py -- --num-gpus=16 --epochs=10
+    --script=cifar10_distributed_training.py -- --num-gpus=16 --num-nodes=2 --epochs=10
 ```
 
 Serve a model with vLLM (auto-selects queue / GPUs / parsers):

@@ -106,7 +106,7 @@ directory, so `--script=<file>` is relative):
 # 2 nodes, 16 H200 GPUs (InfiniBand)
 ./submit_torchrun_job.sh 2 --queue=gpu_h200_parallel --venv=~/torch_env --script=test_torchrun.py
 ```
-Success prints `[PASS] ... all ranks` and, on IB, `NET/IB/*/GDRDMA` in the NCCL debug output.
+Success prints `[PASS]` lines for all-reduce, all-gather and bandwidth and, on IB, `NET/IB/*/GDRDMA` in the NCCL debug output.
 
 ### Pitfall: a long solo phase on rank 0
 

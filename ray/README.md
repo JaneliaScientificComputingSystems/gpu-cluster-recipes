@@ -61,9 +61,9 @@ chmod +x *.sh
 
 python -m venv ~/ray_env
 source ~/ray_env/bin/activate
-pip install "ray[train,data]" torch torchvision torchaudio
+pip install "ray[train,data]" torch torchvision
 
-# For GPT-2 and ImageNet examples
+# For GPT-2 text generation (tiktoken) and prepare_openwebtext.sh (datasets)
 pip install datasets tiktoken
 
 # For the cell segmentation example

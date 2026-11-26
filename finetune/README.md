@@ -106,9 +106,12 @@ etc. (Note: `import unsloth` requires a GPU — it will error on the login node.
 ./submit_unsloth.sh --max-samples=100 --max-steps=5
 
 # Real adapter — full pass over your data on an H200
-./submit_unsloth.sh --queue=gpu_h200 --dataset=/path/to/mydata.jsonl \
+./submit_unsloth.sh --queue=gpu_h200 --dataset=/path/to/mydata.jsonl --max-samples=0 \
     --output=../models/gemma4_myadapter -- --epochs=3 --max-steps=-1
 ```
+
+The defaults are sized for a quick trial: the first 1000 rows of the dataset and 60 steps.
+`--max-samples=0` uses every row, and `--max-steps=-1` trains for the full `--epochs`.
 
 Options (see `./submit_unsloth.sh --help`): `--queue` (default `gpu_h100`), `--dataset`, `--output`,
 `--model`, `--max-samples`, `--max-steps`, `--epochs`, `--walltime`, `--venv`.
