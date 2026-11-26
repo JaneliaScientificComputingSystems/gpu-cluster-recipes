@@ -10,7 +10,7 @@
 #   ./submit_torchrun_job.sh <num_nodes> --script=SCRIPT [options] [-- script_args...]
 #
 # Examples:
-#   # Multi-node on parallel queues (whole nodes, all GPUs):
+#   # Multi-node on parallel queues (whole nodes, all GPUs, 2+ nodes):
 #   ./submit_torchrun_job.sh 2 --script=train.py --venv=~/myenv
 #   ./submit_torchrun_job.sh 4 --queue=gpu_h200_parallel --script=train.py \
 #       -- --epochs=50 --batch-size=128
@@ -26,7 +26,7 @@
 #       --workdir=~/RNAnix --script=~/RNAnix/runner/train_rna.py \
 #       -- --dtype bf16 --max_steps 50000
 #
-# Parallel queues (whole nodes, multi-node):
+# Parallel queues (whole nodes, 2 or more nodes — never single-node jobs):
 #   gpu_b300_parallel  -> 96 CPUs, 8 GPUs, InfiniBand NCCL
 #   gpu_h200_parallel  -> 96 CPUs, 8 GPUs, InfiniBand NCCL
 #   gpu_h100_parallel  -> 96 CPUs, 8 GPUs, InfiniBand NCCL  [default]
@@ -221,6 +221,14 @@ esac
 
 if [ "$PARALLEL_QUEUE" = false ] && [ $NUM_NODES -gt 1 ]; then
     echo "ERROR: Non-parallel queues only support 1 node. Use a parallel queue for multi-node."
+    exit 1
+fi
+
+# Site policy: *_parallel queues are for multi-node jobs only (they allocate
+# whole nodes without CPU fencing or memory limits).
+if [ "$PARALLEL_QUEUE" = true ] && [ $NUM_NODES -lt 2 ]; then
+    echo "ERROR: $QUEUE_NAME is a parallel queue — never submit single-node jobs to it."
+    echo "       For one node use ${QUEUE_NAME%_parallel} with --num-gpus=N (up to ${GPUS_PER_NODE})."
     exit 1
 fi
 

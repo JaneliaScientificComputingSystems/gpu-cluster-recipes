@@ -8,13 +8,14 @@
 #
 # Examples:
 #   # Multi-node on parallel queues (whole nodes, all GPUs, 2+ nodes):
-#   ./submit_ray_job.sh 2 --script=test_ray_cluster.py
+#   ./submit_ray_job.sh 2 --venv=~/ray_env --script=cifar10_distributed_training.py \
+#       -- --num-gpus=16 --num-nodes=2 --epochs=10
 #   ./submit_ray_job.sh 8 --queue=gpu_b300_parallel --venv=~/ray_env \
-#       --script=train_ray.py -- --epochs=50
+#       --script=imagenet_distributed_training.py -- --num-gpus=64 --num-nodes=8 --epochs=90
 #
 #   # Single-node on non-parallel queues (request specific GPU count):
 #   ./submit_ray_job.sh 1 --queue=gpu_h100 --num-gpus=2 --venv=~/ray_env \
-#       --script=train_ray.py -- --epochs=20
+#       --script=cifar10_distributed_training.py -- --num-gpus=2 --num-nodes=1 --epochs=20
 #
 # Parallel queues (whole nodes, 2 or more nodes — never single-node jobs):
 #   gpu_b300_parallel  -> 96 CPUs, 8 GPUs, InfiniBand NCCL

@@ -169,7 +169,7 @@ directory, so `--script=<file>` is relative):
 
 ```bash
 # Single node, 8 L4 GPUs (Ethernet). One node goes to the non-parallel queue: the
-# *_parallel queues are for jobs of two or more nodes
+# *_parallel queues are for jobs of two or more nodes, and the launcher refuses one node there
 ./submit_torchrun_job.sh 1 --queue=gpu_l4 --num-gpus=8 --venv=~/torch_env --script=test_torchrun.py
 
 # 2 nodes, 16 H200 GPUs (InfiniBand)

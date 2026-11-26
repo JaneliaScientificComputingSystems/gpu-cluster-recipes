@@ -92,6 +92,11 @@ pip install scipy scikit-image pycocotools
 | `livecell_finetune.py` | Swin-B fine-tuning on LIVECell — cell segmentation |
 | `cell_segmenter.py` | Cell segmentation inference — produces colored masks |
 | `sequence_search.py` | Distributed protein sequence search — k-mer similarity against FASTA DB |
+| `test_queries.fasta` | Sample protein sequences to try with `sequence_search.py --query` |
+| `gpt2_model.py` | GPT-2 architecture, shared by the GPT-2 training, evaluation and generation scripts |
+| `resnet18_cifar.py` | ResNet-18 for CIFAR-10, shared by the CIFAR-10 training and inference scripts |
+| `train_utils.py` | Helper shared by the training scripts: sums counters across ranks for correct metrics |
+| `train_logging.py` | Helper shared by the training scripts: writes rank-0 progress lines straight to a file |
 
 ---
 
@@ -577,7 +582,7 @@ Same ImageNet-1K dataset as the ResNet-50 example — pre-installed at `/nrs/ml_
 |-----|--------------|
 | H200 (141 GB) | 64–128 |
 | H100 (80 GB) | 32–64 |
-| A100 (40/80 GB) | 16–32 |
+| A100 (80 GB) | 16–32 |
 
 ---
 
