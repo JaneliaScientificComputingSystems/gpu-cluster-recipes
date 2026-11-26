@@ -63,8 +63,8 @@ usage() {
     echo "  --output-dir=PATH    Output log directory (default: ../output)"
     echo "  --host=\"H1 H2 ...\"   Pin job to specific hosts (#BSUB -m); useful for node isolation"
     echo "  --sandbox=KIND       Run each node's worker in a sandbox: bwrap or podman (agentic-sandbox)."
-    echo "                       The network is chosen by queue: InfiniBand queues reach the job's own"
-    echo "                       nodes only; Ethernet queues keep the node's network."
+    echo "                       The launcher picks the network: two or more nodes use the node's own"
+    echo "                       network (with InfiniBand on those queues); one node has none."
     echo "  --sandbox-dir=PATH   Where sandbox-run.sh / podman-run.sh live (default: \$AGENTIC_SANDBOX_DIR,"
     echo "                       else wherever they are found on PATH)"
     echo "  --image=IMAGE        Container image for --sandbox=podman (default: agentic-sandbox-gpu)"
@@ -435,7 +435,9 @@ if [ -n "$SANDBOX" ]; then
     chmod +x "$SANDBOX_SCRIPT"
     SANDBOX_PREFIX="$(printf '%q' "$SANDBOX_SCRIPT") "
     echo "Sandbox:       $SANDBOX ($SANDBOX_DIR/$SANDBOX_WRAPPER)"
-    echo "Sandbox net:   $([ "$NETWORK_BACKEND" = IB ] && echo "the job's own nodes only, data over InfiniBand" || echo "the node's own network (Ethernet queue)")"
+    if [ "$NUM_NODES" -eq 1 ]; then echo "Sandbox net:   none (one node)"
+    elif [ "$NETWORK_BACKEND" = IB ]; then echo "Sandbox net:   the node's own network, data over InfiniBand"
+    else echo "Sandbox net:   the node's own network (Ethernet queue)"; fi
     SB_RO_LIST=""; for ((k = 0; k < ${#SB_MOUNTS[@]}; k += 2)); do [ "${SB_MOUNTS[k]}" = --ro ] && SB_RO_LIST+=" ${SB_MOUNTS[k+1]}"; done
     echo "Sandbox write: ${SB_RW[*]}"
     echo "Sandbox read:  ${SB_RO_LIST:- (nothing else)}"

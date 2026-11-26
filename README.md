@@ -4,8 +4,9 @@ Runnable recipes for the Janelia GPU cluster (LSF): distributed training with **
 **PyTorch/torchrun**, **fine-tuning** (LoRA and multi-node FSDP), and large-model inference with
 **vLLM**. Each area is self-contained in its own directory with its own README.
 
-**Cluster context:** jobs submit via LSF (`bsub`). GPU queues: `gpu_l4`, `gpu_a100`, `gpu_h100`,
-`gpu_h200`, `gpu_b300` (plus `*_parallel` variants for whole-node / multi-node). Shared models
+**Cluster context:** jobs submit via LSF (`bsub`). GPU queues: `gpu_l4`, `gpu_a100`, `gpu_rtx6000`,
+`gpu_h100`, `gpu_h200`, `gpu_b300` (one node), plus a `*_parallel` variant of each for jobs of two
+or more whole nodes. Shared models
 live under `/misc/hf/`, shared Apptainer images under `/misc/local/singularity/`.
 
 ## Contents
@@ -46,6 +47,10 @@ NCCL / InfiniBand bandwidth test:
 torchrun/submit_torchrun_job.sh 4 --queue=gpu_b300_parallel --venv=~/torch_env \
     --script=$PWD/torchrun/test_torchrun_ibstress.py -- --max-mb 4096 --secs 600
 ```
+
+The Ray and torchrun launchers can run the training inside a sandbox (`--sandbox=bwrap|podman`,
+from [agentic-sandbox](https://github.com/JaneliaScientificComputingSystems/agentic-sandbox)), for
+code you did not write yourself; see their READMEs.
 
 See each directory's `README.md` (and, for vLLM, `vllm/VLLM_SERVING_GUIDE.md` +
 `vllm/KIMI_K3_VLLM_GUIDE.md`) for full details.

@@ -5,7 +5,7 @@ Multi-node PyTorch via **`torchrun` + LSF `blaunch`**, for code that uses plain 
 address/port, launches `torchrun` on every node via `blaunch` (`rdzv_backend=c10d`), and
 auto-configures NCCL per queue — InfiniBand queues (**B300 at XDR 800 Gb/s**, H100/H200 at NDR
 400 Gb/s) source [`../nccl-ib/nccl_ib.sh`](../nccl-ib/) (or `nccl_ib_b300.sh` on B300) and run an IB
-pre-flight check; Ethernet queues (L4/A100) fall back to socket NCCL.
+pre-flight check; Ethernet queues (L4/A100/RTX 6000) fall back to socket NCCL.
 
 ## Environment
 
@@ -88,7 +88,7 @@ The launcher picks the network; there is nothing to choose:
 |---|---|
 | 2+ nodes | the node's own network, not limited, so that the nodes reach each other. Files, home directory, keys and tokens stay hidden as always |
 | 2+ nodes on an InfiniBand queue (B300, H200, H100) | the same, with the InfiniBand devices: NCCL's data goes over InfiniBand directly |
-| one node | none |
+| one node | none (on an InfiniBand queue the InfiniBand devices are still there) |
 
 Limits:
 
@@ -168,8 +168,9 @@ directory, so `--script=<file>` is relative):
 ### Sanity check
 
 ```bash
-# Single node, 8 L4 GPUs (Ethernet)
-./submit_torchrun_job.sh 1 --queue=gpu_l4_parallel --venv=~/torch_env --script=test_torchrun.py
+# Single node, 8 L4 GPUs (Ethernet). One node goes to the non-parallel queue: the
+# *_parallel queues are for jobs of two or more nodes
+./submit_torchrun_job.sh 1 --queue=gpu_l4 --num-gpus=8 --venv=~/torch_env --script=test_torchrun.py
 
 # 2 nodes, 16 H200 GPUs (InfiniBand)
 ./submit_torchrun_job.sh 2 --queue=gpu_h200_parallel --venv=~/torch_env --script=test_torchrun.py

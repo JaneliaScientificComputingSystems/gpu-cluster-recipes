@@ -52,8 +52,8 @@ usage() {
     echo "  --walltime=TIME      Walltime in hours (default: 24:00 non-parallel, auto parallel)"
     echo "  --venv=PATH          Python venv path"
     echo "  --sandbox=KIND       Run Ray and the script in one sandbox per node: bwrap or podman"
-    echo "                       (agentic-sandbox). The network is chosen by queue: InfiniBand queues"
-    echo "                       reach the job's own nodes only; Ethernet queues keep the node's network."
+    echo "                       (agentic-sandbox). The launcher picks the network: two or more nodes use"
+    echo "                       the node's own network (with InfiniBand on those queues); one node has none."
     echo "  --sandbox-dir=PATH   Where sandbox-run.sh / podman-run.sh live (default: \$AGENTIC_SANDBOX_DIR,"
     echo "                       else wherever they are found on PATH)"
     echo "  --image=IMAGE        Container image for --sandbox=podman (default: agentic-sandbox-gpu)"
@@ -442,7 +442,7 @@ open(p, 'w').write(s.replace('__SCRIPT_CMD__', cmd))
     SB_RO_LIST=""; for ((k = 0; k < ${#SB_MOUNTS[@]}; k += 2)); do [ "${SB_MOUNTS[k]}" = --ro ] && SB_RO_LIST+=" ${SB_MOUNTS[k+1]}"; done
     echo "Sandbox:         $SANDBOX ($SANDBOX_DIR/$SANDBOX_WRAPPER)"
     if [ "$NUM_NODES" -eq 1 ]; then echo "Sandbox net:     none (one node)"
-    elif [ "$NETWORK_BACKEND" = IB ]; then echo "Sandbox net:     the job's own nodes only, data over InfiniBand"
+    elif [ "$NETWORK_BACKEND" = IB ]; then echo "Sandbox net:     the node's own network, data over InfiniBand"
     else echo "Sandbox net:     the node's own network (Ethernet queue)"; fi
     echo "Sandbox write:   ${SB_RW[*]}"
     echo "Sandbox read:   ${SB_RO_LIST:- (nothing else)}"

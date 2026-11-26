@@ -175,7 +175,7 @@ Key options: `--engine apptainer|podman|venv` (default apptainer) · `--model` (
 `--host-pin` · `--exit-after-test` · `--webui` / `--webui-no-auth` (§7) · `--no-api-key`.
 Run `./serve_vllm.sh --help` for all.
 
-The script picks CPU slots to match the queue's ratio (12/GPU, 8/GPU on L4), times the load,
+The script picks CPU slots to match the queue's ratio (12/GPU; 8 on L4, 16 on RTX 6000), times the load,
 waits for `/health`, and smoke-tests. The server binds `0.0.0.0:8000` → reachable at
 `http://<node>.int.janelia.org:8000/v1` from anywhere on the internal network or VPN.
 
@@ -200,8 +200,8 @@ The key also lets the job confirm that the server answering on its port is its o
 `/health` goes green it checks that its key is accepted, and fails with a clear error if another
 job's server holds the port.
 
-> ⚠️ **Walltime:** omitting `-W` gives the queue *default* (often 120 min) and the job dies at
-> 2 h. Pass a large `--walltime` (e.g. `336:00` = 14 days) to keep a server up.
+> ⚠️ **Walltime:** `serve_vllm.sh` asks for 8 hours unless you pass `--walltime`; the server
+> stops when that runs out. Pass a large value (e.g. `336:00` = 14 days) to keep a server up.
 
 ---
 
@@ -334,11 +334,11 @@ compute node is visible to everyone on the network.
 
 | Symptom | Cause / fix |
 |---|---|
-| bsub **hangs** on submit | Requested CPUs exceed the queue's slots/GPU ratio — vLLM stalls on a warning. Match the ratio (12/GPU, 8 on L4); `serve_vllm.sh` does this automatically. |
+| bsub **hangs** on submit | Requested CPUs exceed the queue's slots/GPU ratio — vLLM stalls on a warning. Match the ratio (12/GPU; 8 on L4, 16 on RTX 6000); `serve_vllm.sh` does this automatically. |
 | `OSError: Read-only file system: '/nrs'` at import (apptainer) | Host env leaked in. Use `apptainer --cleanenv` and point caches at `/scratch` (the script does). |
 | `Read-only file system: '.../flashinfer_cubin/...'` (MXFP4 MoE, e.g. gpt-oss) | FlashInfer JITs cubins into the read-only image. Set `FLASHINFER_CUBIN_DIR` to a writable `/scratch` dir (the script does). |
 | `"auto" tool choice requires …` on chat | Serve with `--enable-auto-tool-choice --tool-parser … --reasoning-parser …` (§5). |
-| Job killed at ~2 h | No `-W` → 120-min queue default. Pass a large `--walltime`. |
+| Server gone after 8 h | The default `--walltime` is `8:00`. Pass a larger one. |
 | Podman `Found 0 CDI devices` | CDI not generated on the node — admin runs `nvidia-ctk cdi generate` (§3c). |
 | Podman re-pulls the image every job | Its store is node-local `/scratch` (purged). Prefer Apptainer/SIF — no pull ever. |
 | `"python": not found` in a container | It's `python3`, not `python`. |

@@ -58,8 +58,10 @@ Podman variant (vendor image, GPU via CDI):
 > **Apptainer (the recommended path above) needs none of this** — that's the main reason to prefer it.
 
 > Drop `--webui` to serve the API only; add `--exit-after-test` to just measure load time and quit.
-> The `--tool-parser/--reasoning-parser` flags are **required** if you'll use Open WebUI or any
-> tool-calling client, or chat fails with *`"auto" tool choice requires …`*.
+> `serve_vllm.sh` knows Kimi-K3: given only `--model /misc/hf/moonshotai/Kimi-K3` it sets the SIF,
+> the full node and the `kimi_k3` parsers by itself. The commands above spell them out. Without
+> the parsers, Open WebUI or any tool-calling client fails with
+> *`"auto" tool choice requires …`*.
 
 ---
 

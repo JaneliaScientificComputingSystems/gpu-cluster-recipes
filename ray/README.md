@@ -104,7 +104,7 @@ Options:
   --queue=QUEUE        GPU queue (default: gpu_h100_parallel)
   --num-gpus=N         GPUs per node (non-parallel queues, default: 1)
   --num-cpus=N         CPUs to request (non-parallel queues, default: the queue's slots per GPU —
-                       l4=8, l4_16/rtx6000=16, a100/h100/h200/b300=12)
+                       l4=8, l4_16/rtx6000=16, l4_large=64, a100/h100/h200/b300=12)
   --venv=PATH          Python venv path
   --job-name=NAME      Job name (default: ray_job)
   --walltime=TIME      Walltime (default: 24h non-parallel, 4-8h parallel)
@@ -175,7 +175,11 @@ How it differs from a normal run:
   its raylet exits. Without `--sandbox`, Ray daemons are left on each node and the script runs
   in the job script.
 - **Ray's ports are fixed**, from 11000 up. A multi-node job has its nodes to itself on the
-  parallel queues, so they do not collide with another job.
+  parallel queues, so they do not collide with another job. The per-job ports and the per-job
+  temp dir described under [Monitoring](#monitoring) belong to a run without `--sandbox`.
+- **Ray still has no authentication** on two or more nodes (see
+  [Known limitations](#known-limitations)): the sandbox uses the node's network, and the head
+  port is 11001. Someone who attaches runs code inside the sandbox, with what the sandbox sees.
 - **With `podman` the image is pulled on every node first** (about two minutes for the default
   image on a node that does not have it yet), and a host venv does not work inside it.
 - **Tested:** CIFAR-10, 3 epochs, on two H200 nodes over InfiniBand (60.8% with `podman`,
